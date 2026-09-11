@@ -928,6 +928,38 @@ def _patched(module, **attributes):
             setattr(module, name, value)
 
 
+def test_live_port_taker_fak_and_yes_window():
+    """LivePort.match allows paper-like taker FAK fills, and enforces (0.48, 0.90] for YES."""
+    transport = _StubTransport(results=[
+        {"ok": True, "status": "matched", "filled_shares": Decimal("10"), "avg_price": Decimal("0.55"),
+         "cost": Decimal("5.5"), "unfilled": ZERO, "detail": ""}
+    ])
+    port = _live_port(transport, account=ACCOUNT_OK, preflight=True)
+
+    # 1. YES leg within (0.48, 0.90] with order_type=FAK -> executed as taker
+    yes_leg_valid = {"leg": "buy_yes_new", "outcome": "YES", "token_id": "TOK_YES",
+                     "order_type": "FAK", "side": "BUY", "best_ask": "0.55"}
+    res1 = port.match(leg=yes_leg_valid, book={"best_ask": "0.55"}, limit=Decimal("0.55"), shares=Decimal("10"))
+    assert res1["filled_shares"] == Decimal("10"), res1
+    call1 = transport.calls[-1][1]
+    assert call1["post_only"] is False, "FAK taker order must have post_only=False"
+    assert call1["order_type"] == "FAK", "FAK taker order must have order_type=FAK"
+    assert call1["clamp"] is False, "FAK taker order must not be clamped"
+
+    # 2. YES leg <= 0.48 (e.g. 0.40, 0.48) -> denied
+    for invalid_floor in ("0.40", "0.48"):
+        res_floor = port.match(leg={**yes_leg_valid, "best_ask": invalid_floor},
+                               book={"best_ask": invalid_floor}, limit=Decimal(invalid_floor), shares=Decimal("10"))
+        assert res_floor["status"] == "denied_yes_range", res_floor
+        assert res_floor["filled_shares"] == ZERO
+
+    # 3. YES leg > 0.90 (e.g. 0.91) -> denied
+    res_cap = port.match(leg={**yes_leg_valid, "best_ask": "0.91"},
+                         book={"best_ask": "0.91"}, limit=Decimal("0.91"), shares=Decimal("10"))
+    assert res_cap["status"] == "denied_yes_range", res_cap
+    assert res_cap["filled_shares"] == ZERO
+
+
 CHECKS = [
     ("config: env overrides (mode/budget/max_open)", test_load_config_env_overrides),
     ("config: live via env still needs port gates", test_env_override_live_still_needs_port_gates),
@@ -939,6 +971,7 @@ CHECKS = [
     ("paper: stdlib run needs no v2 SDK", test_paper_engine_needs_no_v2_sdk),
     ("live: preflight honours real caps", test_live_port_preflight_uses_real_caps),
     ("live: match branches (partial/full/none/cancel/timeout)", test_live_port_match_branches),
+    ("live: taker FAK and YES window (0.48, 0.90]", test_live_port_taker_fak_and_yes_window),
     ("v2: clamp keeps orders passive", test_v2_clamp_limit),
     ("v2: execute_leg end to end (stub)", test_v2_execute_leg_end_to_end),
     ("v2: cancel retry + residual risk", test_v2_cancel_retry_and_residual_risk),

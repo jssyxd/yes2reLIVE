@@ -547,13 +547,11 @@ def average_fill_price(client, order_id: str, *, token_id: str | None = None) ->
     return (cost / shares).quantize(QTY)
 
 
-# --------------------------------------------------------------------------- execute one leg
-
 def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tick=None,
                 neg_risk: bool | None = None, gates: dict | None = None, post_only: bool = True,
-                clamp: bool = True, poll_attempts: int = 6, poll_sleep: float = 1.0, sleep=None,
-                audit_path=None, take_down_unfilled: bool = True) -> dict:
-    """Place ONE passive limit order and reconcile the real fill. The submit never retries.
+                order_type: str = "GTC", clamp: bool = True, poll_attempts: int = 6,
+                poll_sleep: float = 1.0, sleep=None, audit_path=None, take_down_unfilled: bool = True) -> dict:
+    """Place one order leg (passive maker or FAK taker) and reconcile the real fill.
 
     ``gates`` must be a fully-passing gate record (``submit.gate_status``): the dangerous
     direction is unreachable without proof that all three gates were satisfied.
@@ -575,17 +573,30 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
     reference = refetch_book(client, token_id) if clamp else None
     if reference is None:
         reference = book
-    clamped = clamp_limit(side=side, limit=want, book=reference, tick=tick)
-    if not clamped["ok"]:
-        return {**out, "status": clamped["reason"], "detail": clamped["detail"]}
-    limit, step = clamped["price"], clamped["tick"]
-    out.update({"limit_price": str(limit), "clamped": bool(clamped["clamped"])})
-    passive = submit.check_non_marketable(side=side, price=limit, book=reference)
-    if not passive["ok"]:
-        return {**out, "status": passive["reason"], "detail": passive["detail"]}
+
+    if clamp:
+        clamped = clamp_limit(side=side, limit=want, book=reference, tick=tick)
+        if not clamped["ok"]:
+            return {**out, "status": clamped["reason"], "detail": clamped["detail"]}
+        limit, step = clamped["price"], clamped["tick"]
+        out.update({"limit_price": str(limit), "clamped": bool(clamped["clamped"])})
+    else:
+        raw_tick = tick if tick is not None else (reference or {}).get("tick_size") if isinstance(reference, dict) else None
+        step = _dec(raw_tick or "0.01", "tick", allow_zero=False)
+        limit = (want / step).to_integral_value(rounding=ROUND_DOWN) * step
+        out.update({"limit_price": str(limit), "clamped": False})
+
+    if post_only:
+        passive = submit.check_non_marketable(side=side, price=limit, book=reference)
+        if not passive["ok"]:
+            return {**out, "status": passive["reason"], "detail": passive["detail"]}
+    else:
+        # Taker / FAK order: price sanity check
+        if limit <= ZERO or limit > Decimal("1.0"):
+            return {**out, "status": "invalid_price", "detail": f"price {limit} out of (0, 1]"}
 
     params = {"token_id": str(token_id), "side": side, "price": str(limit), "size": str(shares),
-              "clamped": bool(clamped["clamped"]), "post_only": post_only}
+              "clamped": bool(out.get("clamped")), "post_only": post_only, "order_type": order_type}
     submit.audit({"actor": "live/v2_transport.py", "action": "intent", "reason": "execute_leg",
                   "params": params}, path=audit_path)
 
@@ -595,7 +606,8 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
                                                neg_risk=bool(neg_risk) if neg_risk is not None else None)
     signed = client.create_order(args, options)
     try:
-        response = client.post_order(signed, lib["OrderType"].GTC, post_only=post_only)
+        c_order_type = getattr(lib["OrderType"], order_type, lib["OrderType"].FAK) if order_type == "FAK" else lib["OrderType"].GTC
+        response = client.post_order(signed, c_order_type, post_only=post_only)
     except Exception as exc:  # noqa: BLE001 - the order may or may not have landed
         detail = f"{type(exc).__name__}: {exc}"
         submit.audit({"actor": "live/v2_transport.py", "action": "exception", "reason": "submit_failed",
@@ -621,9 +633,10 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
               "terminal": fill.get("terminal"), "response_summary": summary,
               "detail": fill.get("detail", "")}
 
-    # the engine wants "fill now or stand down", so the unfilled remainder is taken down here;
-    # the smoke order deliberately keeps it resting so the place→query→cancel loop can be tested
-    needs_takedown = take_down_unfilled and (shares - filled) > ZERO \
+    # the engine wants "fill now or stand down":
+    # for FAK orders, Polymarket server automatically kills any unfilled remainder;
+    # for GTC orders, cancel unfilled remainder here.
+    needs_takedown = (order_type != "FAK") and take_down_unfilled and (shares - filled) > ZERO \
         and str(fill["status"]).lower() not in ("cancelled", "canceled")
     if needs_takedown:
         takedown = cancel_with_retry(client, order_id, sleep=sleep, audit_path=audit_path)

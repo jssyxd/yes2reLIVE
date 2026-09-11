@@ -177,29 +177,61 @@ class LivePort(ExecutionPort):
     # ---------------------------------------------------------------- fill
     def match(self, *, leg: dict, book: Any, limit: Decimal, shares: Decimal, fire: dict | None = None,
               cfg: dict | None = None) -> dict:
-        """One passive post-only order through the v2 transport; real fills come back."""
+        """Execute one order leg through the v2 transport (FAK taker fill or passive maker)."""
         client = getattr(self, "_client", None)
         if client is None:
             return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
                     "status": "live_not_preflighted", "source": LIVE,
                     "detail": "preflight must run before any order"}
+
+        is_yes = (str(leg.get("outcome") or "").upper() == "YES") or (str(leg.get("leg") or "") == "buy_yes_new")
+        if is_yes:
+            # Hard-guard: 仅当 YES 在 (0.48, 0.90] 时才吃单
+            yes_floor = Decimal("0.48")
+            yes_cap = Decimal("0.90")
+            raw_ask = leg.get("best_ask")
+            if raw_ask is None and isinstance(book, dict):
+                raw_ask = book.get("best_ask")
+            if raw_ask is not None:
+                try:
+                    ask_dec = Decimal(str(raw_ask))
+                except Exception:
+                    ask_dec = None
+                if ask_dec is not None and (ask_dec <= yes_floor or ask_dec > yes_cap):
+                    return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
+                            "status": "denied_yes_range", "source": LIVE,
+                            "detail": f"YES ask {ask_dec} not in (0.48, 0.90]"}
+            if limit > yes_cap:
+                return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
+                        "status": "denied_yes_cap", "source": LIVE,
+                        "detail": f"YES limit {limit} > 0.90"}
+
+        # Taker FAK execution when order_type is FAK (paper-like fills against resting asks)
+        order_type = str(leg.get("order_type") or "").upper()
+        is_taker = (order_type == "FAK") or bool(leg.get("is_taker", False))
+        post_only = False if is_taker else bool(leg.get("post_only", True))
+        clamp = False if is_taker else bool(leg.get("clamp", True))
+
         token_id = leg.get("token_id")
-        result = self.transport.execute_leg(
-            client,
-            token_id=str(token_id),
-            side=str(leg.get("side") or "BUY"),
-            price=limit,
-            size=shares,
-            book=book,
-            tick=leg.get("tick") or (book or {}).get("tick_size") if isinstance(book, dict) else None,
-            neg_risk=bool((book or {}).get("neg_risk")) if isinstance(book, dict) else None,
-            gates=self.gates,
-            post_only=True,
-            poll_attempts=self.poll_attempts,
-            poll_sleep=self.poll_sleep,
-            sleep=self.sleep,
-            audit_path=self.audit_path,
-        )
+        exec_kwargs = {
+            "client": client,
+            "token_id": str(token_id),
+            "side": str(leg.get("side") or "BUY"),
+            "price": limit,
+            "size": shares,
+            "book": book,
+            "tick": leg.get("tick") or (book or {}).get("tick_size") if isinstance(book, dict) else None,
+            "neg_risk": bool((book or {}).get("neg_risk")) if isinstance(book, dict) else None,
+            "gates": self.gates,
+            "post_only": post_only,
+            "order_type": "FAK" if is_taker else "GTC",
+            "clamp": clamp,
+            "poll_attempts": self.poll_attempts,
+            "poll_sleep": self.poll_sleep,
+            "sleep": self.sleep,
+            "audit_path": self.audit_path,
+        }
+        result = self.transport.execute_leg(**exec_kwargs)
         return {"filled_shares": result.get("filled_shares") or ZERO,
                 "avg_price": result.get("avg_price"),
                 "cost": result.get("cost") or ZERO,
