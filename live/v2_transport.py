@@ -15,6 +15,10 @@ v2 specifics handled here (each was a real failure mode):
   armed with a sentinel and **never released** (calling it is refused by the arm step)
 * open orders come from ``get_open_orders()`` (there is no ``get_orders``)
 * ``create_order`` returns a ``SignedOrderV2`` **object** (attributes, no ``dict.get``)
+* a **taker** (FAK) order must be built with the SDK's market-order API
+  (``create_market_order(MarketOrderArgsV2(...))``): the venue caps a market order's maker
+  amount at **2 decimals of USDC** (BUY) / **4 decimals of shares** (SELL) and rejects the
+  ``create_order`` shape with ``400 invalid amounts`` (real failure, 2026-09-12)
 * the book must be refetched and the limit clamped **immediately before** submitting,
   otherwise a ``post_only`` order is rejected with ``order crosses book``
 * a cancel failure is retried and, if it still fails, reported as **residual order risk**
@@ -120,6 +124,7 @@ def _dec(value, field: str, *, allow_zero: bool = True) -> Decimal:
 def _py_clob_v2() -> dict[str, Any]:
     """Lazy import of py-clob-client-v2; clear error when the venv is missing."""
     try:
+        from py_clob_client_v2 import clob_types as _types
         from py_clob_client_v2.clob_types import (ApiCreds, AssetType, BalanceAllowanceParams,
                                                   OrderArgs, OrderType, PartialCreateOrderOptions)
         from py_clob_client_v2.client import ClobClient
@@ -127,7 +132,11 @@ def _py_clob_v2() -> dict[str, Any]:
         raise RuntimeError(f"{exc}\n{V2_HINT}") from None
     return {"ClobClient": ClobClient, "ApiCreds": ApiCreds, "OrderArgs": OrderArgs,
             "OrderType": OrderType, "PartialCreateOrderOptions": PartialCreateOrderOptions,
-            "AssetType": AssetType, "BalanceAllowanceParams": BalanceAllowanceParams}
+            "AssetType": AssetType, "BalanceAllowanceParams": BalanceAllowanceParams,
+            #: ``MarketOrderArgsV2`` is the current name; older builds export the plain alias.
+            #: ``None`` when this build has neither ⇒ the taker path refuses (never falls back).
+            "MarketOrderArgs": (getattr(_types, "MarketOrderArgsV2", None)
+                                or getattr(_types, "MarketOrderArgs", None))}
 
 
 def sdk_available() -> bool:
@@ -554,6 +563,17 @@ def average_fill_price(client, order_id: str, *, token_id: str | None = None) ->
 MAKER_ORDER_MODE = "maker"
 TAKER_ORDER_MODE = "taker"
 
+#: which SDK entry point built the order (``order_api`` in the audit log)
+LIMIT_ORDER_API = "limit"
+MARKET_ORDER_API = "market"
+
+#: the venue's precision limit for a **market** order ``amount`` (real 400, 2026-09-12):
+#: ``invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals,
+#: taker amount a max of 4 decimals`` ⇒ BUY ⇒ amount is the USDC nominal (2 dp), SELL ⇒ the
+#: share count (4 dp).  Both are floored, never rounded up: the order must stay affordable.
+MARKET_AMOUNT_DECIMALS = {"BUY": Decimal("0.01"), "SELL": Decimal("0.0001")}
+MARKET_AMOUNT_UNIT = {"BUY": "USDC", "SELL": "shares"}
+
 #: the single ``post_order`` call site exists exactly once and serves both modes.  Taker is
 #: **FAK** (fill-and-kill: the unfilled remainder is voided server-side, nothing rests); maker
 #: keeps the historical **GTC**.  The literal GTC string is kept inline for the maker branch so
@@ -569,6 +589,30 @@ def _tick_of(book, tick) -> Decimal:
         return _dec(raw or "0.01", "tick", allow_zero=False)
     except ValueError:
         return Decimal("0.01")
+
+
+def market_amount(*, side: str, limit, shares) -> Decimal | None:
+    """The ``amount`` a **market** (FAK) order may carry — floored to the venue's precision.
+
+    ``create_order`` (limit-order args) produced a maker amount the venue refuses for a market
+    order (``400 invalid amounts``); the market API takes an ``amount`` instead of a size:
+
+    * ``BUY``  ⇒ ``amount`` = the **USDC nominal** (``shares * limit``) floored to **2 decimals**;
+    * ``SELL`` ⇒ ``amount`` = the **share count** floored to **4 decimals**.
+
+    Flooring (never rounding up) keeps the spend at or below the intended notional, so the same
+    budget still covers it.  ``None`` for an unknown side or an unparseable input.
+    """
+    step = MARKET_AMOUNT_DECIMALS.get(side)
+    if step is None:
+        return None
+    try:
+        price = _dec(limit, "limit", allow_zero=False)
+        size = _dec(shares, "shares", allow_zero=False)
+    except ValueError:
+        return None
+    raw = size * price if side == "BUY" else size
+    return (raw / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
 def _taker_cap(value) -> Decimal | None:
@@ -627,6 +671,10 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
       limit that is not tick-aligned is refused (``price_not_on_tick``) instead of being moved.
       ``submit.check_non_marketable`` is skipped **by design** (an aggressive order is
       marketable by definition) — that is exactly why the caller must gate the mode first.
+      The order itself is built with the SDK's **market-order** API
+      (``create_market_order(MarketOrderArgsV2(amount=...))``) because the venue enforces market
+      precision on it (BUY ``amount`` = USDC to 2 dp, SELL = shares to 4 dp); the ``create_order``
+      limit path fails that check with ``400 invalid amounts`` (real failure, 2026-09-12).
 
     ``audit_extra`` is merged into the ``intent``/``submit`` audit params so the caller's
     fill-mode decision (``taker_gate`` / ``yes_price`` …) travels with the mandatory record.
@@ -635,7 +683,9 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
            "avg_price": None, "cost": ZERO, "unfilled": _safe_dec(size), "residual_risk": False,
            "limit_price": None, "detail": "", "clamped": False,
            "order_mode": TAKER_ORDER_MODE if taker else MAKER_ORDER_MODE,
-           "order_type": ORDER_TYPE_FAK if taker else ORDER_TYPE_GTC}
+           "order_type": ORDER_TYPE_FAK if taker else ORDER_TYPE_GTC,
+           "order_api": MARKET_ORDER_API if taker else LIMIT_ORDER_API,
+           "market_amount": None, "amount_unit": None}
     if not submit.gates_all_passed(gates):
         submit.audit({"actor": "live/v2_transport.py", "action": "deny", "reason": "gates_missing",
                       "params": {"intent": "execute_leg", "token_id": str(token_id),
@@ -648,10 +698,17 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
         return {**out, "status": "invalid_input", "detail": str(exc)}
 
     extra_params: dict[str, Any] = dict(audit_extra or {})
+    #: the market-order ``amount`` (USDC for BUY / shares for SELL).  Assigned by the taker branch
+    #: below — which returns *before* any signing if the amount would not be representable, so a
+    #: taker order can never reach the call site with the placeholder value.
+    amount: Decimal = ZERO
     lib = None
     if taker:
         # an aggressive order is never post-only, whatever the caller asked for
         post_only = False
+        if side not in MARKET_AMOUNT_DECIMALS:
+            return {**out, "status": "invalid_input",
+                    "detail": f"side: want BUY or SELL (got {side!r})"}
         # the aggressive order type must really exist: silently falling back to GTC would leave a
         # marketable order *resting* on the book (the one thing FAK exists to prevent)
         lib = _py_clob_v2()
@@ -690,8 +747,31 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
             return {**out, "status": "price_not_on_tick",
                     "detail": (f"taker limit {want} is not a multiple of tick {step} — refuse "
                                f"(the taker path never moves the price)")}
+        # a MARKET order carries an ``amount``, not a size — and the venue caps its precision
+        # (BUY: USDC to 2 dp, SELL: shares to 4 dp).  Computed here, floored, and *before* the
+        # mandatory intent audit so the recorded numbers are the ones that go out.
+        amount_dec = market_amount(side=side, limit=want, shares=shares)
+        if amount_dec is None or amount_dec <= ZERO:
+            _deny_audit(audit_path, "amount_below_precision",
+                        {**extra_params, "price": str(want), "size": str(shares),
+                         "side": side})
+            return {**out, "status": "amount_below_precision",
+                    "detail": (f"market amount for {shares} share(s) @ {want} floors to 0 at "
+                               f"{MARKET_AMOUNT_DECIMALS[side]} ({MARKET_AMOUNT_UNIT[side]}) — "
+                               f"refuse, nothing sent")}
+        amount = amount_dec
+        if lib.get("MarketOrderArgs") is None \
+                or getattr(client, "create_market_order", None) is None:
+            # fail closed: the size-based ``create_order`` shape is exactly what the venue
+            # rejects for a market order (400 invalid amounts), so it is never a fallback.
+            _deny_audit(audit_path, "no_market_order_api",
+                        {**extra_params, "price": str(want), "size": str(shares), "side": side})
+            return {**out, "status": "no_market_order_api",
+                    "detail": ("this SDK build has no create_market_order/MarketOrderArgs — "
+                               "refusing to send a FAK order through the limit-order shape")}
         limit = want
-        out.update({"limit_price": str(limit), "clamped": False})
+        out.update({"limit_price": str(limit), "clamped": False,
+                    "market_amount": str(amount), "amount_unit": MARKET_AMOUNT_UNIT[side]})
     else:
         reference = refetch_book(client, token_id) if clamp else None
         if reference is None:
@@ -708,18 +788,31 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
     params = {"token_id": str(token_id), "side": side, "price": str(limit), "size": str(shares),
               "clamped": bool(out["clamped"]), "post_only": post_only}
     params.update(extra_params)
-    # the computed mode/type are authoritative: they can never be spoofed through ``audit_extra``
+    # the computed mode/type/api are authoritative: they can never be spoofed through ``audit_extra``
     params["order_mode"] = out["order_mode"]
     params["order_type"] = out["order_type"]
+    params["order_api"] = out["order_api"]
+    if taker:
+        # the market-order ``amount`` that actually goes out (USDC for BUY, shares for SELL)
+        params["amount"] = out["market_amount"]
+        params["amount_unit"] = out["amount_unit"]
     submit.audit({"actor": "live/v2_transport.py", "action": "intent", "reason": "execute_leg",
                   "params": params}, path=audit_path)
 
     if lib is None:
         lib = _py_clob_v2()
-    args = lib["OrderArgs"](token_id=str(token_id), price=float(limit), size=float(shares), side=side)
     options = lib["PartialCreateOrderOptions"](tick_size=str(step),
                                                neg_risk=bool(neg_risk) if neg_risk is not None else None)
-    signed = client.create_order(args, options)
+    if taker:
+        # market-order API: ``amount`` (not ``size``) with the venue's precision, and the limit is
+        # passed explicitly so the SDK never walks the book to guess a market price.
+        market_args = lib["MarketOrderArgs"](token_id=str(token_id), amount=float(amount),
+                                             side=side, price=float(limit),
+                                             order_type=lib["OrderType"].FAK)
+        signed = client.create_market_order(market_args, options)
+    else:
+        args = lib["OrderArgs"](token_id=str(token_id), price=float(limit), size=float(shares), side=side)
+        signed = client.create_order(args, options)
     order_type = lib["OrderType"].FAK if taker else lib["OrderType"].GTC
     try:
         response = client.post_order(signed, order_type, post_only=post_only)

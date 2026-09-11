@@ -433,6 +433,11 @@ class _StubV2Client:
         self.calls.append(("create_order", args, options))
         return "SIGNED-V2"
 
+    def create_market_order(self, args, options):
+        """The market-order signing path the taker branch must use (never ``create_order``)."""
+        self.calls.append(("create_market_order", args, options))
+        return "SIGNED-MARKET-V2"
+
     def post_order(self, signed, order_type, post_only=False):
         self.calls.append(("post_order", signed, str(order_type), post_only))
         return {"orderID": "ORD-1", "status": "live", "success": True}
@@ -468,6 +473,14 @@ def _stub_v2_lib():
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
+    class MarketOrderArgsV2:
+        """Market-order args: ``amount`` (USDC for BUY / shares for SELL), not a size."""
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    MarketOrderArgs = MarketOrderArgsV2
+
     class PartialCreateOrderOptions:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -488,6 +501,8 @@ def _stub_v2_lib():
             self.__dict__.update(kwargs)
 
     mod.OrderArgs = OrderArgs
+    mod.MarketOrderArgsV2 = MarketOrderArgsV2
+    mod.MarketOrderArgs = MarketOrderArgs
     mod.PartialCreateOrderOptions = PartialCreateOrderOptions
     mod.OrderType = OrderType
     mod.ApiCreds = ApiCreds
@@ -527,6 +542,7 @@ def test_v2_execute_leg_end_to_end():
     assert result["avg_price"] == Decimal("0.59"), result
     kinds = [call[0] for call in client.calls]
     assert kinds.count("post_order") == 1 and kinds.count("create_order") == 1, kinds
+    assert result["order_api"] == "limit" and result["market_amount"] is None, result
     *_, post_only = [c for c in client.calls if c[0] == "post_order"][0]
     assert post_only is True
     assert ("cancel_orders", ("ORD-1",)) in client.calls, client.calls
@@ -1303,15 +1319,26 @@ def test_live_taker_order_construction():
     posts = [call for call in client.calls if call[0] == "post_order"]
     assert len(posts) == 1, client.calls
     assert posts[0][2] == "FAK" and posts[0][3] is False, posts[0]
-    assert client.calls[0][0] == "create_order", client.calls
+    # the taker is signed through the **market** API (never through ``create_order``, whose maker
+    # amount the venue rejects for a market order as ``400 invalid amounts``)
+    assert client.calls[0][0] == "create_market_order", client.calls
+    assert "create_order" not in [call[0] for call in client.calls], client.calls
+    assert posts[0][1] == "SIGNED-MARKET-V2", posts[0]
     args = client.calls[0][1]
-    assert Decimal(str(args.price)) == Decimal("0.83") and str(args.size) == "10.0", vars(args)
+    assert Decimal(str(args.price)) == Decimal("0.83"), vars(args)
+    # 10 shares @ 0.83 = 8.30 USDC — a BUY market order carries USDC, not a share count
+    assert Decimal(str(args.amount)) == Decimal("8.30"), vars(args)
+    assert not hasattr(args, "size"), vars(args)
+    assert result["order_api"] == "market" and result["market_amount"] == "8.30", result
+    assert result["amount_unit"] == "USDC", result
     # FAK is terminal: the remainder is voided, no cancel (and no false residual risk)
     assert not [call for call in client.calls if call[0] == "cancel_orders"], client.calls
     assert result["residual_risk"] is False, result
     intent = lines[0]
     assert intent["action"] == "intent" and intent["params"]["order_mode"] == "taker", intent
     assert intent["params"]["order_type"] == "FAK" and intent["params"]["post_only"] is False, intent
+    assert intent["params"]["order_api"] == "market", intent
+    assert intent["params"]["amount"] == "8.30" and intent["params"]["amount_unit"] == "USDC", intent
     assert intent["params"]["taker_gate"] == "yes_band", intent
     assert intent["params"]["yes_price"] == "0.83", intent
 
@@ -1348,6 +1375,147 @@ def test_live_taker_order_construction():
     assert refused["ok"] is False and refused["status"] == "no_fak_order_type", refused
     assert no_fak.calls == [], no_fak.calls
     assert [line["reason"] for line in lines] == ["no_fak_order_type"], lines
+
+
+def test_live_taker_market_amount_precision():
+    """The 400 that broke the live taker (2026-09-12): market-order ``amount`` precision.
+
+    Real failure — BUY 8.19 shares @ 0.61 went out through the *limit* shape with maker amount
+    ``4.9959`` USDC and the venue answered: ``invalid amounts, the market buy orders maker amount
+    supports a max accuracy of 2 decimals, taker amount a max of 4 decimals``.  The taker is now
+    signed through ``create_market_order`` with a floored ``amount``:
+
+    * BUY  ⇒ USDC nominal, **≤ 2 decimals** and never above the leg's own notional;
+    * SELL ⇒ share count, **≤ 4 decimals** and never above the position size;
+    * both ⇒ ``post_order(signed, FAK, post_only=False)`` — and ``create_order`` never called.
+    """
+    def _places(dec: Decimal) -> int:
+        return -dec.as_tuple().exponent          # decimals actually carried by the amount
+
+    # (a) the pure helper, on the exact numbers of the failed live fire
+    real = v2_transport.market_amount(side="BUY", limit="0.61", shares="8.19")
+    assert real == Decimal("4.99"), real
+    assert _places(real) <= 2 and real < Decimal("8.19") * Decimal("0.61"), real
+    assert v2_transport.market_amount(side="SELL", limit="0.61", shares="12.345678") == \
+        Decimal("12.3456")
+    assert v2_transport.market_amount(side="HOLD", limit="0.61", shares="1") is None
+    assert v2_transport.market_amount(side="BUY", limit="0", shares="1") is None
+    assert v2_transport.market_amount(side="BUY", limit="abc", shares="1") is None
+
+    # (b) BUY through execute_leg: amount is USDC, ≤ 2 dp, ≤ notional
+    buy = _taker_client(matched="8.18", price="0.61")
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        out = v2_transport.execute_leg(
+            buy, token_id="TOK_YES", side="BUY", price="0.61", size="8.19",
+            book={"best_ask": "0.61", "tick_size": "0.01", "neg_risk": True},
+            gates=GATES_OK, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+            audit_path=log)
+        lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+                 if line.strip()]
+    signed = [call for call in buy.calls if call[0] == "create_market_order"]
+    assert len(signed) == 1, buy.calls
+    args = signed[0][1]
+    assert args.side == "BUY" and str(args.order_type) == "FAK", vars(args)
+    assert Decimal(str(args.price)) == Decimal("0.61"), vars(args)
+    amount = Decimal(str(args.amount))
+    assert amount == Decimal("4.99") and _places(amount) <= 2, vars(args)
+    assert amount <= Decimal("8.19") * Decimal("0.61"), amount
+    assert not hasattr(args, "size"), vars(args)
+    assert [call[2:] for call in buy.calls if call[0] == "post_order"] == [("FAK", False)], buy.calls
+    assert "create_order" not in [call[0] for call in buy.calls], buy.calls
+    assert out["order_api"] == "market" and out["market_amount"] == "4.99", out
+    assert out["amount_unit"] == "USDC", out
+    intent = lines[0]["params"]
+    assert intent["order_api"] == "market" and intent["amount"] == "4.99", intent
+    assert intent["amount_unit"] == "USDC" and intent["order_type"] == "FAK", intent
+    assert intent["post_only"] is False, intent
+
+    # (c) SELL through execute_leg: amount is a share count, ≤ 4 dp, ≤ the size asked for
+    sell = _taker_client(matched="12.3456", price="0.61")
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        out_sell = v2_transport.execute_leg(
+            sell, token_id="TOK_YES", side="SELL", price="0.61", size="12.345678",
+            book={"best_bid": "0.61", "tick_size": "0.01", "neg_risk": True},
+            gates=GATES_OK, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+            audit_path=log)
+        sell_lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+                      if line.strip()]
+    assert out_sell["ok"] is True, out_sell
+    s_args = [call for call in sell.calls if call[0] == "create_market_order"][0][1]
+    s_amount = Decimal(str(s_args.amount))
+    assert s_args.side == "SELL", vars(s_args)
+    assert s_amount == Decimal("12.3456") and _places(s_amount) <= 4, vars(s_args)
+    assert s_amount <= Decimal("12.345678"), s_amount
+    assert [call[2:] for call in sell.calls if call[0] == "post_order"] == [("FAK", False)], sell.calls
+    assert "create_order" not in [call[0] for call in sell.calls], sell.calls
+    assert out_sell["market_amount"] == "12.3456" and out_sell["amount_unit"] == "shares", out_sell
+    assert sell_lines[0]["params"]["amount_unit"] == "shares", sell_lines[0]
+
+    # (d) an amount that floors to 0 is refused with nothing signed and nothing sent
+    tiny = _taker_client()
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        refused = v2_transport.execute_leg(
+            tiny, token_id="TOK_YES", side="BUY", price="0.01", size="0.004",
+            book={"best_ask": "0.01", "tick_size": "0.01", "neg_risk": True},
+            gates=GATES_OK, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+            audit_path=log)
+        refused_lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+                         if line.strip()]
+    assert refused["ok"] is False and refused["status"] == "amount_below_precision", refused
+    assert tiny.calls == [], tiny.calls
+    assert [line["reason"] for line in refused_lines] == ["amount_below_precision"], refused_lines
+
+    # (e) fail closed (mutation check): no market API ⇒ refuse, never fall back to the limit shape
+    class _NoMarketApi(_StubV2Client):
+        create_market_order = None
+
+    no_api = _NoMarketApi()
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        no_api_out = v2_transport.execute_leg(
+            no_api, token_id="TOK_YES", side="BUY", price="0.61", size="8.19",
+            book={"best_ask": "0.61", "tick_size": "0.01", "neg_risk": True},
+            gates=GATES_OK, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+            audit_path=log)
+        no_api_lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+                        if line.strip()]
+    assert no_api_out["ok"] is False and no_api_out["status"] == "no_market_order_api", no_api_out
+    assert no_api.calls == [], no_api.calls
+    assert [line["reason"] for line in no_api_lines] == ["no_market_order_api"], no_api_lines
+
+    # ... and the same when the SDK build has no ``MarketOrderArgs`` at all
+    no_args = _taker_client(matched="8.18", price="0.61")
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        import py_clob_client_v2.clob_types as _types
+        saved_types = (_types.MarketOrderArgsV2, _types.MarketOrderArgs)
+        log = Path(tmp) / "audit.jsonl"
+        try:
+            _types.MarketOrderArgsV2 = None
+            _types.MarketOrderArgs = None
+            no_args_out = v2_transport.execute_leg(
+                no_args, token_id="TOK_YES", side="BUY", price="0.61", size="8.19",
+                book={"best_ask": "0.61", "tick_size": "0.01", "neg_risk": True},
+                gates=GATES_OK, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+                audit_path=log)
+        finally:
+            _types.MarketOrderArgsV2, _types.MarketOrderArgs = saved_types
+    assert no_args_out["status"] == "no_market_order_api", no_args_out
+    assert no_args.calls == [], no_args.calls
+    # ... while the maker path is untouched: it still signs through ``create_order``
+    maker = _StubV2Client()
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        made = v2_transport.execute_leg(
+            maker, token_id="TOK_NO", side="BUY", price="0.599", size="10",
+            book={"best_ask": "0.60", "tick_size": "0.01", "neg_risk": True},
+            gates=GATES_OK, sleep=lambda _s: None, poll_attempts=2,
+            audit_path=Path(tmp) / "a.jsonl")
+    kinds = [call[0] for call in maker.calls]
+    assert made["ok"] is True and kinds.count("create_order") == 1, maker.calls
+    assert "create_market_order" not in kinds, maker.calls
+    assert made["order_api"] == "limit" and made["market_amount"] is None, made
 
 
 def test_live_taker_fill_accounting():
@@ -1650,6 +1818,7 @@ CHECKS = [
     ("live taker: absolute price bounds (L-3)", test_live_taker_price_bounds),
     ("live taker: evidence chain (leg → fire → re-quote)", test_live_taker_evidence_chain),
     ("live taker: order construction (FAK, no clamp)", test_live_taker_order_construction),
+    ("live taker: market amount precision (USDC 2dp / shares 4dp)", test_live_taker_market_amount_precision),
     ("live taker: partial/zero fill accounting", test_live_taker_fill_accounting),
     ("live taker: gates/preflight not bypassable", test_live_taker_gates_not_bypassable),
     ("live taker: limits kept, band fail-closed", test_live_taker_limits_and_band_fail_closed),

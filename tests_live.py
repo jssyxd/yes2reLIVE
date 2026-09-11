@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import inspect
 import io
 import json
 import sys
@@ -352,25 +353,30 @@ def test_reconcile_cli_json_and_exit_codes():
 
 #: names that must never appear as a *real call* anywhere in live/
 FORBIDDEN_CALLS = (
-    "create_and_post_order", "post_order", "post_orders", "create_market_order",
+    "create_and_post_order", "post_order", "post_orders",
     "cancel", "cancel_order", "cancel_orders", "cancel_all", "cancel_market_orders",
     "create_api_key", "derive_api_key", "delete_api_key", "update_balance_allowance",
     "post_heartbeat", "delete_readonly_api_key", "submit",
 )
-#: signing entry point (local only) — allowed in the phase-2 dry run and the submit channel
-SIGN_ONLY_CALLS = ("create_order",)
+#: signing entry points (local only, zero network) — allowed in the phase-2 dry run and the
+#: submit channel; ``create_market_order`` is the taker's market-order signing call (2026-09-12)
+SIGN_ONLY_CALLS = ("create_order", "create_market_order")
+#: signing calls the confinement check below polices like a write (``create_order`` keeps its own
+#: dedicated assertion: the phase-2 dry run legitimately signs with it)
+CONFINED_SIGN_CALLS = ("create_market_order",)
 #: the controlled write channels (v1 submit.py, v2 v2_transport.py) — nowhere else
 SUBMIT_MODULE = "submit.py"
 WRITE_CHANNEL_MODULES = (SUBMIT_MODULE, "v2_transport.py")
 #: write calls allowed inside those channels only
-CONTROLLED_WRITE_CALLS = ("create_order", "post_order", "cancel", "cancel_order", "cancel_orders")
+CONTROLLED_WRITE_CALLS = ("create_order", "create_market_order", "post_order", "cancel",
+                          "cancel_order", "cancel_orders")
 #: v2-client-only methods: inside the v2 transport they must stay pure data (never a code use);
 #: callers may only reach them through the v1 channel's module function (``submit.cancel_order``)
 V2_CLIENT_ONLY = ("cancel_order",)
 #: modules a caller may delegate a write call to (``submit.cancel_order(...)`` etc.)
 DELEGATE_MODULES = {"submit", "sign_dryrun", "v2_transport"}
 #: names that may appear in SUBMIT_MODULE only as their single call site
-CHANNEL_ONLY = ("post_order", "cancel", "cancel_orders")
+CHANNEL_ONLY = ("create_market_order", "post_order", "cancel", "cancel_orders")
 #: module-name style uses we do not police (``submit.audit(...)`` in the orchestrator)
 NAME_USAGE_SKIP = {"submit"}
 
@@ -393,7 +399,8 @@ def test_static_no_order_path():
     files = sorted((ROOT / "live").glob("*.py"))
     assert files, "no live/ modules found"
     calls = {name: [] for name in CONTROLLED_WRITE_CALLS}
-    uses = {name: [] for name in FORBIDDEN_CALLS if name not in NAME_USAGE_SKIP}
+    uses = {name: [] for name in set(FORBIDDEN_CALLS) | set(SIGN_ONLY_CALLS)
+            if name not in NAME_USAGE_SKIP}
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -408,7 +415,7 @@ def test_static_no_order_path():
                         f"{path.name}:{node.lineno} calls a computed function (f()()) — hidable write path"
                     )
                     name = None
-                if name in FORBIDDEN_CALLS:
+                if name in FORBIDDEN_CALLS or name in CONFINED_SIGN_CALLS:
                     delegated = (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
                                  and func.value.id in DELEGATE_MODULES)
                     assert path.name in WRITE_CHANNEL_MODULES or delegated, (
@@ -429,6 +436,15 @@ def test_static_no_order_path():
     assert {site.split(":")[0] for site in calls["cancel_orders"]} == {"v2_transport.py"}, calls["cancel_orders"]
     assert {site.split(":")[0] for site in calls["create_order"]} == \
         {"v2_transport.py", "sign_dryrun.py"}, calls["create_order"]
+    # the taker's market-order signing call: exactly one site, in the v2 channel, and it is
+    # *inside* the taker branch (the maker path stays on ``create_order``)
+    assert {site.split(":")[0] for site in calls["create_market_order"]} == {"v2_transport.py"}, \
+        calls["create_market_order"]
+    assert len(calls["create_market_order"]) == 1, calls["create_market_order"]
+    assert "create_market_order" in inspect.getsource(v2_transport.execute_leg), \
+        "the taker path must sign through the market-order API"
+    assert "create_order" in inspect.getsource(v2_transport.execute_leg), \
+        "the maker path must keep signing through create_order"
     # the channels' write calls may only appear as those call sites (never as values)
     for name in CHANNEL_ONLY:
         assert len(uses.get(name, [])) == len(calls[name]), (name, uses.get(name), calls[name])
@@ -633,6 +649,10 @@ class _FakeClient:
         self.rfq = _FakeRfq()
 
     def create_order(self, *args, **kwargs):
+        return _FakeSigned()
+
+    def create_market_order(self, *args, **kwargs):
+        """Market-order signing (the taker's path): local only, never posts by itself."""
         return _FakeSigned()
 
     def post_order(self, *args, **kwargs):
@@ -1283,6 +1303,11 @@ class _SmokeClient:
         self.calls.append(("create_order", args, options))
         return "SIGNED-ORDER"
 
+    def create_market_order(self, args, options):
+        """The taker's market-order signing call (``amount`` in USDC / shares)."""
+        self.calls.append(("create_market_order", args, options))
+        return "SIGNED-MARKET-ORDER"
+
     def post_order(self, signed, order_type="GTC", post_only=False):
         self.calls.append(("post_order", signed, order_type, post_only))
         return {"orderID": "ORD-1", "status": "live", "success": True}
@@ -1314,6 +1339,14 @@ def _stub_clob_types():
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
+    class MarketOrderArgsV2:
+        """Market-order args: ``amount`` (USDC for BUY / shares for SELL) instead of a size."""
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    MarketOrderArgs = MarketOrderArgsV2
+
     class PartialCreateOrderOptions:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -1334,6 +1367,8 @@ def _stub_clob_types():
             self.__dict__.update(kwargs)
 
     mod.OrderArgs = OrderArgs
+    mod.MarketOrderArgsV2 = MarketOrderArgsV2
+    mod.MarketOrderArgs = MarketOrderArgs
     mod.PartialCreateOrderOptions = PartialCreateOrderOptions
     mod.OrderType = OrderType
     mod.ApiCreds = ApiCreds
