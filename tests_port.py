@@ -1558,6 +1558,32 @@ def test_live_taker_fill_accounting():
     assert via_port["cost"] == ZERO and via_port["order_mode"] == "taker", via_port
 
 
+def test_live_taker_fak_no_match_clean_cancellation():
+    """When Polymarket kills an FAK order with no match, status is cancelled and residual_risk is False."""
+    class _FakKilledClient(_StubV2Client):
+        def post_order(self, signed, order_type, post_only=False):
+            self.calls.append(("post_order", signed, str(order_type), post_only))
+            exc = Exception("400 Bad Request")
+            exc.error_msg = {
+                "error": "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.",
+                "orderID": "0xdeadbeef1234"
+            }
+            raise exc
+
+    client = _FakKilledClient()
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        result = v2_transport.execute_leg(
+            client, token_id="TOK_YES", side="BUY", price="0.83", size="10",
+            book={"best_ask": "0.83", "tick_size": "0.01", "neg_risk": True},
+            gates=GATES_OK, taker=True, cap="0.90", sleep=lambda _s: None,
+            audit_path=log, audit_extra={"taker_gate": "yes_band", "yes_price": "0.83"})
+    assert result["ok"] is True and result["order_id"] == "0xdeadbeef1234", result
+    assert result["status"] == "cancelled" and result["filled_shares"] == ZERO, result
+    assert result["unfilled"] == Decimal("10") and result["voided_shares"] == Decimal("10"), result
+    assert result["residual_risk"] is False and result["fill_and_kill"] is True, result
+
+
 def test_live_taker_gates_not_bypassable():
     """A band-eligible take is impossible without the gates *and* without a live preflight."""
     client = _StubV2Client()
@@ -1821,6 +1847,7 @@ CHECKS = [
     ("live taker: market amount precision (USDC 2dp / shares 4dp)", test_live_taker_market_amount_precision),
     ("live taker: partial/zero fill accounting", test_live_taker_fill_accounting),
     ("live taker: gates/preflight not bypassable", test_live_taker_gates_not_bypassable),
+    ("live taker: FAK no match clean cancellation", test_live_taker_fak_no_match_clean_cancellation),
     ("live taker: limits kept, band fail-closed", test_live_taker_limits_and_band_fail_closed),
     ("live taker: pure decision adds no audit row (L-1)", test_live_taker_decision_alone_is_not_audited),
     ("live taker: engine fire path is leg-level", test_live_fire_intent_is_leg_level),

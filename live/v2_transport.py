@@ -817,6 +817,21 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
     try:
         response = client.post_order(signed, order_type, post_only=post_only)
     except Exception as exc:  # noqa: BLE001 - the order may or may not have landed
+        err_msg = getattr(exc, "error_msg", None) or getattr(exc, "error_message", None)
+        if isinstance(err_msg, dict) and "no orders found to match with FAK" in str(err_msg.get("error", "")):
+            oid = err_msg.get("orderID")
+            submit.audit({"actor": "live/v2_transport.py", "action": "submit",
+                          "reason": "fak_no_match", "params": params,
+                          "response_summary": str(err_msg), "order_id": oid}, path=audit_path)
+            res = {**out, "ok": True, "order_id": oid, "status": "cancelled",
+                   "filled_shares": ZERO, "avg_price": None, "cost": ZERO,
+                   "unfilled": shares, "terminal": True, "response_summary": str(err_msg),
+                   "detail": "no orders found to match with FAK order (killed)"}
+            if taker:
+                res["fill_and_kill"] = True
+                res["voided_shares"] = shares
+            return res
+
         detail = f"{type(exc).__name__}: {exc}"
         submit.audit({"actor": "live/v2_transport.py", "action": "exception", "reason": "submit_failed",
                       "params": params, "response_summary": detail}, path=audit_path)
