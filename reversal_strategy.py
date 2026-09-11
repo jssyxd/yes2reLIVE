@@ -788,27 +788,32 @@ def maybe_arm_or_fire(
         "legs": [],
         "fire_budget_ms": int(cfg.get("fire_budget_ms", 8000)),
     }
-    if not _skip_no_leg:
+    no_enabled = bool(cfg.get("no_leg_enabled", True))
+    no_pct = Decimal(str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT)))
+    if not _skip_no_leg and no_enabled and no_pct > 0:
         fire["legs"].append({
             "leg": "buy_no_broken",
             "token_id": fire["broken_no_token"],
             "side": "BUY",
             "outcome": "NO",
             "cap": str(cfg.get("no_max_ask", NO_MAX_ASK)),
-            "notional_pct": str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT)),
+            "notional_pct": str(no_pct),
             "floor": str(cfg.get("no_min_ask") or ""),
             "bucket_lo": broken.get("lo"),
             "bucket_hi": broken.get("hi"),
             "bucket_label": bucket_label(broken, unit),
         })
     if fire_yes and new_b is not None:
+        yes_pct = str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT))
+        if (not no_enabled or no_pct <= 0) and "yes_notional_pct" not in cfg:
+            yes_pct = "1.0"
         fire["legs"].append({
             "leg": "buy_yes_new",
             "token_id": fire["new_yes_token"],
             "side": "BUY",
             "outcome": "YES",
             "cap": str(cfg.get("yes_max_ask", YES_MAX_ASK)),
-            "notional_pct": str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT)),
+            "notional_pct": yes_pct,
             "floor": str(cfg.get("yes_min_ask") or ""),
             "bucket_lo": new_b.get("lo"),
             "bucket_hi": new_b.get("hi"),

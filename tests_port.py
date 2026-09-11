@@ -708,8 +708,9 @@ GOLDEN_CONFIG = json.loads(r"""
   "max_bucket_jump": 1,
   "max_obs_future_seconds": 900,
   "max_obs_lookback_seconds": 5400,
+  "no_leg_enabled": false,
   "no_max_ask": "1.0",
-  "no_notional_pct": 0.25,
+  "no_notional_pct": 0.0,
   "require_consensus_filter": true,
   "require_fresh_obs_seconds": 180,
   "sleeve_enabled": false,
@@ -724,7 +725,7 @@ GOLDEN_CONFIG = json.loads(r"""
   "yes_leg_enabled": true,
   "yes_max_ask": "0.9",
   "yes_min_ask": "0.48",
-  "yes_notional_pct": 0.75
+  "yes_notional_pct": 1.0
  },
  "taf_refresh_interval_seconds": 1800,
  "tail_hours": 144,
@@ -750,8 +751,9 @@ GOLDEN_STRATEGY = json.loads(r"""
  "max_bucket_jump": 1,
  "max_obs_future_seconds": 900,
  "max_obs_lookback_seconds": 5400,
+ "no_leg_enabled": false,
  "no_max_ask": "1.0",
- "no_notional_pct": 0.25,
+ "no_notional_pct": 0.0,
  "require_consensus_filter": true,
  "require_fresh_obs_seconds": 180,
  "sleeve_enabled": false,
@@ -766,7 +768,7 @@ GOLDEN_STRATEGY = json.loads(r"""
  "yes_leg_enabled": true,
  "yes_max_ask": "0.9",
  "yes_min_ask": "0.48",
- "yes_notional_pct": 0.75
+ "yes_notional_pct": 1.0
 }
 """)
 

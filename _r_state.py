@@ -269,6 +269,12 @@ def save_state(path: str | os.PathLike, state: dict[str, Any]) -> None:
     tmp = d.with_suffix(d.suffix + ".tmp")
     tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     tmp.replace(d)
+    try:
+        from _r_globals import save_tracker
+        cpath = d.parent / "yes2re_consensus.json"
+        save_tracker(str(cpath))
+    except Exception:
+        pass
 
 
 def log_event(path: str | os.PathLike, event: dict[str, Any]) -> None:

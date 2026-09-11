@@ -6,6 +6,9 @@ not a bucket the market already abandoned.
 """
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -272,6 +275,95 @@ class ConsensusTracker:
             "top": [{"bucket_id": a, "twap": str(b), "depth": str(c)} for a, b, c in ranks[:3]],
             "checked_at_utc": _iso(now),
         }
+
+    def to_dict(self, now_utc: datetime | None = None) -> dict[str, Any]:
+        now = now_utc or datetime.now(timezone.utc)
+        out: dict[str, Any] = {
+            "version": 1,
+            "saved_at_utc": _iso(now),
+            "window_seconds": self.window_seconds,
+            "min_samples": self.min_samples,
+            "series": {},
+        }
+        for key, buckets in self._series.items():
+            key_series: dict[str, list[dict[str, Any]]] = {}
+            for bid, bseries in buckets.items():
+                bseries.prune(now, self.window_seconds)
+                if not bseries.samples:
+                    continue
+                samples_data = []
+                for s in bseries.samples:
+                    samples_data.append({
+                        "ts": _iso(s.ts_utc),
+                        "m": str(s.mid),
+                        "a": str(s.best_ask) if s.best_ask is not None else None,
+                        "b": str(s.best_bid) if s.best_bid is not None else None,
+                        "d": str(s.ask_depth),
+                    })
+                if samples_data:
+                    key_series[bid] = samples_data
+            if key_series:
+                out["series"][key] = key_series
+        return out
+
+    def from_dict(self, data: dict[str, Any], now_utc: datetime | None = None) -> None:
+        if not isinstance(data, dict):
+            return
+        series_data = data.get("series")
+        if not isinstance(series_data, dict):
+            return
+        now = now_utc or datetime.now(timezone.utc)
+        for key, buckets in series_data.items():
+            if not isinstance(buckets, dict):
+                continue
+            for bid, samples_list in buckets.items():
+                if not isinstance(samples_list, list):
+                    continue
+                bseries = self._series[str(key)].setdefault(str(bid), BucketSeries())
+                for item in samples_list:
+                    if not isinstance(item, dict):
+                        continue
+                    ts_str = item.get("ts")
+                    if not ts_str:
+                        continue
+                    try:
+                        if ts_str.endswith("Z"):
+                            ts_str = ts_str[:-1] + "+00:00"
+                        dt = datetime.fromisoformat(ts_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    bseries.add(
+                        PriceSample(
+                            ts_utc=dt,
+                            mid=_dec(item.get("m")),
+                            best_ask=_dec(item.get("a")) if item.get("a") is not None else None,
+                            best_bid=_dec(item.get("b")) if item.get("b") is not None else None,
+                            ask_depth=_dec(item.get("d")),
+                        )
+                    )
+                bseries.prune(now, self.window_seconds)
+
+    def save_to_file(self, path: str | os.PathLike, now_utc: datetime | None = None) -> None:
+        p = Path(path)
+        if p.parent and not p.parent.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        data = self.to_dict(now_utc=now_utc)
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+
+    def load_from_file(self, path: str | os.PathLike, now_utc: datetime | None = None) -> bool:
+        p = Path(path)
+        if not p.exists() or p.stat().st_size == 0:
+            return False
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            self.from_dict(raw, now_utc=now_utc)
+            return True
+        except Exception:
+            return False
 
 
 # process-local default tracker (runner can inject its own)

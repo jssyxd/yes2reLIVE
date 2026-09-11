@@ -66,7 +66,9 @@ class MarketStream:
         payload.setdefault("asset_id", tid)
         payload.setdefault("tokenId", tid)
         try:
-            return self.books[tid].apply_book(payload)
+            snap = self.books[tid].apply_book(payload)
+            self.event_count += 1
+            return snap
         except OrderBookStateError:
             return None
 
@@ -80,7 +82,7 @@ class MarketStream:
             payload = message
         if not isinstance(payload, dict):
             raise MarketStreamError("invalid_event_shape")
-        event_type = str(payload.get("type", "")).lower()
+        event_type = str(payload.get("event_type") or payload.get("type", "")).lower()
         body = payload.get("payload", payload)
         if event_type in {"subscribe", "subscribed", "ack"}:
             self.mark_subscribed()
@@ -92,14 +94,25 @@ class MarketStream:
         if event_type == "price_change":
             return self._apply_price_changes(body)
         if event_type == "tick_size_change":
-            token = str(body.get("tokenId") or "")
+            token = str(body.get("tokenId") or body.get("asset_id") or "")
+            if not token or token not in self.books:
+                return None
             return self._book(token).apply_tick_size_change(body)
         if event_type == "last_trade_price":
-            token = str(body.get("tokenId") or "")
+            token = str(body.get("tokenId") or body.get("asset_id") or "")
+            if not token or token not in self.books:
+                return None
             book = self._book(token)
             book.last_trade_price = book._optional_decimal(body.get("price"), "last_trade_price")
+            self.event_count += 1
             return book.snapshot()
-        if event_type in {"best_bid_ask", "new_market", "market_resolved", "heartbeat", "ping", "pong"}:
+        if event_type == "best_bid_ask":
+            self.event_count += 1
+            token = str(body.get("asset_id") or body.get("tokenId") or "")
+            if token in watch_tokens():
+                mark_wake()
+            return None
+        if event_type in {"new_market", "market_resolved", "heartbeat", "ping", "pong"}:
             return None
         raise MarketStreamError(f"unsupported_event:{event_type}")
 
@@ -108,8 +121,10 @@ class MarketStream:
             raise OrderBookStateError("unknown_token_id")
         return self.books[token]
 
-    def _apply_book(self, body: dict[str, Any]) -> LocalBookSnapshot:
-        token = str(body.get("tokenId") or body.get("asset_id") or "")
+    def _apply_book(self, body: dict[str, Any]) -> LocalBookSnapshot | None:
+        token = str(body.get("asset_id") or body.get("tokenId") or "")
+        if not token or token not in self.books:
+            return None
         result = self._book(token).apply_book(body)
         self.event_count += 1
         if token in watch_tokens():
@@ -127,8 +142,14 @@ class MarketStream:
                 raise MarketStreamError("invalid_price_change")
             if body.get("timestamp") is not None:
                 change = {**change, "timestamp": body["timestamp"]}
-            token = str(change.get("tokenId") or "")
-            results.append(self._book(token).apply_price_change(change))
+            token = str(change.get("asset_id") or change.get("tokenId") or "")
+            if not token or token not in self.books:
+                continue
+            try:
+                results.append(self._book(token).apply_price_change(change))
+            except OrderBookStateError:
+                # If baseline is missing for this token, ignore delta gracefully
+                continue
             if token in watched:
                 mark_wake()
         self.event_count += 1

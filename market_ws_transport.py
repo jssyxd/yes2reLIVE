@@ -367,7 +367,7 @@ def _feed_text_to_stream(stream: MarketStream, text: str) -> None:
             except OrderBookStateError:
                 pass
         return
-    if isinstance(obj, dict) and obj.get("type"):
+    if isinstance(obj, dict) and (obj.get("type") or obj.get("event_type")):
         stream.handle_message(obj)
 
 

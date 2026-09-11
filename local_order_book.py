@@ -97,7 +97,7 @@ class LocalOrderBook:
         return self.snapshot()
 
     def apply_price_change(self, payload: dict[str, Any]) -> LocalBookSnapshot:
-        token = str(payload.get("tokenId") or "")
+        token = str(payload.get("tokenId") or payload.get("asset_id") or "")
         if token and token != self.token_id:
             raise OrderBookStateError("token_id_mismatch")
         if not self.ready:

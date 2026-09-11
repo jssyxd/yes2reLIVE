@@ -68,12 +68,27 @@ def bump(name: str, now: float) -> None:
         s.at = now
 
 
-def tracker() -> ConsensusTracker:
+_CONSENSUS_PATH = "data/yes2re_consensus.json"
+
+
+def tracker(consensus_path: str | None = None) -> ConsensusTracker:
     """Process-local singleton consensus/gate history."""
     global _TRACKER
     if _TRACKER is None:
         _TRACKER = ConsensusTracker(window_seconds=7200, min_samples=20)
+        try:
+            _TRACKER.load_from_file(consensus_path or _CONSENSUS_PATH)
+        except Exception:
+            pass
     return _TRACKER
+
+
+def save_tracker(path: str | None = None) -> None:
+    if _TRACKER is not None:
+        try:
+            _TRACKER.save_to_file(path or _CONSENSUS_PATH)
+        except Exception:
+            pass
 
 
 def clob(timeout_seconds: float = 8.0) -> CLOBMarketData:
