@@ -1,0 +1,26 @@
+{
+  "mode": "paper",
+  "weatherbotyes2re_enabled": true,
+  "arm_c": 1.0,
+  "max_bucket_jump": 1,
+  "no_max_ask": "0.65",
+  "yes_max_ask": "0.48",
+  "no_notional_pct": 0.75,
+  "yes_notional_pct": 0.25,
+  "yes_leg_enabled": true,
+  "fast_poll_seconds": 8,
+  "fire_budget_ms": 8000,
+  "high_fire_local_hour": 14,
+  "low_fire_local_hour_end": 10,
+  "require_fresh_obs_seconds": 180,
+  "require_consensus_filter": true,
+  "consensus_window_seconds": 7200,
+  "consensus_min_samples": 20,
+  "consensus_min_lead": "0.03",
+  "allow_market_consensus_reference": true,
+  "paper_budget_usdc": "20",
+  "notes": {
+    "data_path": "WS books continuous; Gamma for event/buckets; METAR dual-source on ARM only",
+    "hardware": "Low-latency VPS near Polymarket CLOB (prefer US-E) + stable outbound to aviationweather/checkwx"
+  }
+}

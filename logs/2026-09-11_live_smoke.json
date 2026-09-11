@@ -1,0 +1,443 @@
+{
+  "ok": true,
+  "reason": null,
+  "ts_utc": "2026-09-10T18:07:09Z",
+  "phase": "phase3-smoke",
+  "scenario": false,
+  "mode": "live",
+  "budget_usdc": "5",
+  "gates": {
+    "ok": true,
+    "reason": "ok",
+    "expected_phrase": "SMOKE-2026-09-10",
+    "checks": {
+      "cli_flag": true,
+      "env_flag": true,
+      "confirm_phrase": true
+    },
+    "detail": "all three gates satisfied"
+  },
+  "sentinel": {
+    "armed": true,
+    "released": [
+      "client.post_order",
+      "client.cancel_orders"
+    ],
+    "still_blocked_count": 23,
+    "statement": "least privilege: only post_order/cancel_orders released; every other order/RFQ/credential/state-write method stays sentinel-blocked"
+  },
+  "market": {
+    "city": "beijing",
+    "local_date": "2026-09-11",
+    "direction": "low",
+    "bucket": "13°C",
+    "title": "Will the lowest temperature in Beijing be 13°C on September 11?",
+    "event_slug": null,
+    "volume": 16.11,
+    "token_id": "72076915870638115607991905854683763293575477607242590050238060208134848506627",
+    "no_token_id": null
+  },
+  "book": {
+    "best_bid": "0.04",
+    "best_ask": "0.5",
+    "tick_size": "0.01",
+    "min_order_size": "5",
+    "neg_risk": true,
+    "bids": [
+      {
+        "price": "0.04",
+        "size": "24.99"
+      },
+      {
+        "price": "0.03",
+        "size": "6"
+      },
+      {
+        "price": "0.02",
+        "size": "41"
+      },
+      {
+        "price": "0.01",
+        "size": "16.11"
+      }
+    ],
+    "asks": [
+      {
+        "price": "0.5",
+        "size": "6"
+      },
+      {
+        "price": "0.51",
+        "size": "6.12"
+      },
+      {
+        "price": "0.52",
+        "size": "6.25"
+      },
+      {
+        "price": "0.53",
+        "size": "6.38"
+      },
+      {
+        "price": "0.54",
+        "size": "6.52"
+      }
+    ]
+  },
+  "plan": {
+    "ok": true,
+    "reason": "ok",
+    "detail": "",
+    "side": "BUY",
+    "price": "0.04",
+    "size": "125.00",
+    "max_cost_usdc": "5.000000",
+    "tick": "0.01",
+    "budget_usdc": "5",
+    "price_cap": "0.9",
+    "min_order_size": "5",
+    "token_id": "72076915870638115607991905854683763293575477607242590050238060208134848506627",
+    "direction": "buy_yes"
+  },
+  "risk_gate": {
+    "allow": true,
+    "reason": "ok",
+    "detail": "balance 51.713622 >= budget 12; positions 0/10; committed 0+12 <= cap 50"
+  },
+  "limits_check": {
+    "ok": true,
+    "reason": "ok",
+    "detail": "notional 5.000000 <= 12; 0+5.000000 <= 50"
+  },
+  "non_marketable": {
+    "ok": true,
+    "reason": "ok",
+    "reference_price": "0.5",
+    "detail": "passive: BUY 0.04 vs best_ask 0.5"
+  },
+  "selection": {
+    "rule": "min |best_ask - 0.5| among two-sided buckets (tie: volume)",
+    "assessed": 3,
+    "key": "beijing|2026-09-11|low",
+    "assessment": {
+      "ok": true,
+      "reason": "ok",
+      "detail": "two-sided: bid 0.04 / ask 0.5, near-ask size 18.37, passive 0.04",
+      "best_bid": "0.04",
+      "best_ask": "0.5",
+      "tick": "0.01",
+      "min_order_size": "5",
+      "ask_size_near": "18.37",
+      "ask_distance": "0.0",
+      "passive_price": "0.04"
+    }
+  },
+  "bucket_attempts": [
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "13°C",
+      "token_id": "72076915870638115607991905854683763293575477607242590050238060208134848506627",
+      "volume": 16.11,
+      "best_bid": "0.04",
+      "best_ask": "0.5",
+      "ask_size_near": "18.37",
+      "detail": "two-sided: bid 0.04 / ask 0.5, near-ask size 18.37, passive 0.04",
+      "status": "ok"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "11°C",
+      "token_id": "15899073815070470746498489086928526080072381898995382456247167109724544558283",
+      "volume": null,
+      "best_bid": "0.02",
+      "best_ask": "0.4",
+      "ask_size_near": "5",
+      "detail": "two-sided: bid 0.02 / ask 0.4, near-ask size 5, passive 0.02",
+      "status": "ok"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "12°C",
+      "token_id": "77249121560092466369660407797450243978778336869125547475694782600539381586939",
+      "volume": null,
+      "best_bid": "0.03",
+      "best_ask": "0.4",
+      "ask_size_near": "5",
+      "detail": "two-sided: bid 0.03 / ask 0.4, near-ask size 5, passive 0.03",
+      "status": "ok"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "10°C or below",
+      "token_id": "74210956423338608825200585981214156274794037253291683503799369510974880940500",
+      "volume": null,
+      "best_bid": null,
+      "best_ask": "0.98",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "15°C",
+      "token_id": "60108060035226301419450840608067984140403970890903588096293489223080252149487",
+      "volume": 1323.445173,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "14°C",
+      "token_id": "84833251416255702271509633555860658961334489196858975806406559660761314488155",
+      "volume": 219,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "20°C or higher",
+      "token_id": "102734479711708111148595515982613760445620116412874897805213890463802281781601",
+      "volume": 25,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "19°C",
+      "token_id": "102455987073948441512374862441095012563399934312861776727446451902548361495330",
+      "volume": 25,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    }
+  ],
+  "bucket_rejected": [
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "10°C or below",
+      "token_id": "74210956423338608825200585981214156274794037253291683503799369510974880940500",
+      "volume": null,
+      "best_bid": null,
+      "best_ask": "0.98",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "15°C",
+      "token_id": "60108060035226301419450840608067984140403970890903588096293489223080252149487",
+      "volume": 1323.445173,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "14°C",
+      "token_id": "84833251416255702271509633555860658961334489196858975806406559660761314488155",
+      "volume": 219,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "20°C or higher",
+      "token_id": "102734479711708111148595515982613760445620116412874897805213890463802281781601",
+      "volume": 25,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    },
+    {
+      "key": "beijing|2026-09-11|low",
+      "bucket": "19°C",
+      "token_id": "102455987073948441512374862441095012563399934312861776727446451902548361495330",
+      "volume": 25,
+      "best_bid": null,
+      "best_ask": "0.001",
+      "ask_size_near": null,
+      "detail": "best_bid=None — one-sided/dead bucket",
+      "status": "no_bid"
+    }
+  ],
+  "open_orders_check": {
+    "ok": true,
+    "status": "clear",
+    "attempts": 1,
+    "remaining_ids": [],
+    "lag_observed": false,
+    "note": ""
+  },
+  "order": {
+    "order_id": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e",
+    "submitted": true,
+    "confirmed": {
+      "ok": true,
+      "reason": "ok",
+      "attempts": 1,
+      "status": "live",
+      "size_matched": "0",
+      "last": {
+        "id": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e",
+        "status": "LIVE",
+        "price": "0.04",
+        "original_size": "125",
+        "size_matched": "0",
+        "asset_id": "72076915870638115607991905854683763293575477607242590050238060208134848506627",
+        "side": "BUY",
+        "outcome": "Yes",
+        "market": "0xb6050aea1fda3dd4364433bc7ba3140236436b5a57cd8182835e3e027bb839c6",
+        "created_at": 1789063633,
+        "expiration": "0",
+        "associate_trades": []
+      }
+    },
+    "cancelled": {
+      "canceled": [
+        "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e"
+      ],
+      "not_canceled": {}
+    },
+    "response_summary": {
+      "status": "timeout",
+      "orderID": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e",
+      "clamped": false,
+      "limit_price": "0.04"
+    },
+    "status_after_cancel": "CANCELED"
+  },
+  "reconcile": {
+    "ok": true,
+    "open_orders": 0,
+    "usdc_balance": 51.713622,
+    "positions_value_usdc": 0
+  },
+  "residual_risk": false,
+  "steps": [
+    {
+      "ts_utc": "2026-09-10T18:07:09Z",
+      "action": "intent",
+      "reason": "smoke_order",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:10Z",
+      "action": "sentinel_armed",
+      "reason": "ok",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:11Z",
+      "action": "discover",
+      "reason": "ok",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:12Z",
+      "action": "risk",
+      "reason": "ok",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:12Z",
+      "action": "plan",
+      "reason": "ok",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:12Z",
+      "action": "limits",
+      "reason": "ok",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:12Z",
+      "action": "non_marketable",
+      "reason": "ok",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:20Z",
+      "action": "submit",
+      "reason": "ok",
+      "order_id": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e"
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:20Z",
+      "action": "query",
+      "reason": "ok",
+      "order_id": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e"
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:20Z",
+      "action": "cancel",
+      "reason": "ok",
+      "order_id": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e"
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:21Z",
+      "action": "query",
+      "reason": "ok",
+      "order_id": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e"
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:21Z",
+      "action": "open_orders",
+      "reason": "clear",
+      "order_id": "0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e"
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:26Z",
+      "action": "reconcile",
+      "reason": "ok",
+      "order_id": null
+    },
+    {
+      "ts_utc": "2026-09-10T18:07:26Z",
+      "action": "complete",
+      "reason": "ok",
+      "order_id": null
+    }
+  ],
+  "readonly": false,
+  "snapshot": {
+    "usdc_balance": 51.713622,
+    "open_orders": 0,
+    "positions_value_usdc": 0,
+    "positions_raw_count": 79
+  },
+  "limits": {
+    "fire_budget_usdc": "12",
+    "max_open_positions": "10",
+    "max_capital_usdc": "50"
+  },
+  "price_choice": {
+    "ok": true,
+    "reason": "ok",
+    "price": "0.04",
+    "tick": "0.01",
+    "detail": "passive: 0.04 < min(bid 0.04, ask 0.5 - 2tick)",
+    "best_bid": "0.04",
+    "best_ask": "0.5"
+  },
+  "exit_code": 0
+}

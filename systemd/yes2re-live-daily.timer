@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily timer at 00:01:00 UTC to roll over confirmation phrase for yes2re-live
+
+[Timer]
+OnCalendar=*-*-* 00:01:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

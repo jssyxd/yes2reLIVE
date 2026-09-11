@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily restart for yes2re-live to roll over UTC date confirmation phrase
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart yes2re-live.service

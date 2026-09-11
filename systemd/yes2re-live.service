@@ -1,0 +1,17 @@
+[Unit]
+Description=weatherbotyes2re LIVE runner (real CLOB v2 orders; strategy/logic/infra identical to paper)
+Documentation=file:///root/weatherbotyes2re/AGENTS.md file:///root/weatherbotyes2re/live/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/weatherbotyes2re
+ExecStart=/bin/bash /root/weatherbotyes2re/run_live.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/weatherbotyes2re/data/runner.log
+StandardError=append:/root/weatherbotyes2re/data/runner.log
+
+[Install]
+WantedBy=multi-user.target

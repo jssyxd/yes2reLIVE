@@ -1,0 +1,25 @@
+# Secrets and credentials (NEVER COMMIT REAL KEYS)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Data and temporary files
+data/
+*.log
+tmp/
+scratch/
+.pytest_cache/

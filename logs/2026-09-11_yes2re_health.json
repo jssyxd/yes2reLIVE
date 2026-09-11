@@ -1,0 +1,484 @@
+{
+  "source": "weatherbotyes2re paper runner",
+  "mode": "live",
+  "ts_utc": "2026-09-11T15:13:05.924033Z",
+  "ok": true,
+  "state_path": "data/yes2re_state.json",
+  "armed_count": 21,
+  "armed": [
+    "chengdu|2026-09-11|high",
+    "manila|2026-09-11|high",
+    "qingdao|2026-09-11|high",
+    "wuhan|2026-09-11|high",
+    "shanghai|2026-09-11|high",
+    "taipei|2026-09-11|high",
+    "lucknow|2026-09-11|high",
+    "moscow|2026-09-11|high",
+    "tel-aviv|2026-09-11|high",
+    "istanbul|2026-09-11|high",
+    "cape-town|2026-09-11|high",
+    "warsaw|2026-09-11|high",
+    "mexico-city|2026-09-11|low",
+    "helsinki|2026-09-11|high",
+    "ankara|2026-09-11|high",
+    "paris|2026-09-11|high",
+    "san-francisco|2026-09-11|low",
+    "madrid|2026-09-11|high",
+    "london|2026-09-11|high",
+    "milan|2026-09-11|high",
+    "tokyo|2026-09-12|low"
+  ],
+  "fired_count": 18,
+  "open_positions": 6,
+  "position_i18n_keys": [
+    "warsaw|2026-09-11|low",
+    "toronto|2026-09-11|low",
+    "shenzhen|2026-09-11|high",
+    "austin|2026-09-11|low",
+    "los-angeles|2026-09-11|low",
+    "amsterdam|2026-09-11|high"
+  ],
+  "capital_initial_usdc": "51.713622",
+  "debit_usdc": "0",
+  "remaining_capital_usdc": "51.713622",
+  "entry_count": 6,
+  "version": 2,
+  "feed": {
+    "ts_utc": "2026-09-11T15:13:02.691946Z",
+    "cycle_armed": false,
+    "armed_keys": [
+      "chengdu|2026-09-11|high",
+      "manila|2026-09-11|high",
+      "qingdao|2026-09-11|high",
+      "wuhan|2026-09-11|high",
+      "shanghai|2026-09-11|high",
+      "taipei|2026-09-11|high",
+      "lucknow|2026-09-11|high",
+      "moscow|2026-09-11|high",
+      "tel-aviv|2026-09-11|high",
+      "istanbul|2026-09-11|high",
+      "cape-town|2026-09-11|high",
+      "warsaw|2026-09-11|high",
+      "mexico-city|2026-09-11|low",
+      "helsinki|2026-09-11|high",
+      "ankara|2026-09-11|high",
+      "paris|2026-09-11|high",
+      "san-francisco|2026-09-11|low",
+      "madrid|2026-09-11|high",
+      "london|2026-09-11|high",
+      "milan|2026-09-11|high",
+      "tokyo|2026-09-12|low"
+    ],
+    "fired_keys": [
+      "istanbul|2026-09-11|low",
+      "wuhan|2026-09-11|low",
+      "sao-paulo|2026-09-11|low",
+      "warsaw|2026-09-11|low",
+      "toronto|2026-09-11|low",
+      "beijing|2026-09-11|high",
+      "chicago|2026-09-11|low",
+      "dallas|2026-09-11|low",
+      "seattle|2026-09-11|low",
+      "shenzhen|2026-09-11|high",
+      "guangzhou|2026-09-11|high",
+      "austin|2026-09-11|low",
+      "wellington|2026-09-12|low",
+      "los-angeles|2026-09-11|low",
+      "amsterdam|2026-09-11|high",
+      "munich|2026-09-11|high",
+      "jeddah|2026-09-11|high",
+      "buenos-aires|2026-09-11|high"
+    ],
+    "open_positions": 6,
+    "rules": {
+      "count": 98,
+      "failures": {},
+      "age_s": 497.6
+    },
+    "metar": {
+      "fetched": 49,
+      "cities_ok": 49,
+      "max_obs_age_s": 15182.7,
+      "per_icao": {
+        "CYYZ": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 19.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "EDDM": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 19.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "EFHK": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 16.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "EGLC": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 21.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "EHAM": {
+          "source": "checkwx",
+          "obs_age_s": 1082.7,
+          "temp_c": 20.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "EPWA": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 16.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "FACT": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 20.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KATL": {
+          "source": "checkwx",
+          "obs_age_s": 1262.7,
+          "temp_c": 28.9,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KAUS": {
+          "source": "checkwx",
+          "obs_age_s": 1202.7,
+          "temp_c": 30.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KBKF": {
+          "source": "checkwx",
+          "obs_age_s": 8102.7,
+          "temp_c": 16.9,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KDAL": {
+          "source": "checkwx",
+          "obs_age_s": 1202.7,
+          "temp_c": 30.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KHOU": {
+          "source": "checkwx",
+          "obs_age_s": 1202.7,
+          "temp_c": 28.9,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KLAX": {
+          "source": "checkwx",
+          "obs_age_s": 1202.7,
+          "temp_c": 24.4,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KLGA": {
+          "source": "checkwx",
+          "obs_age_s": 1322.7,
+          "temp_c": 22.8,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KMIA": {
+          "source": "checkwx",
+          "obs_age_s": 1202.7,
+          "temp_c": 27.2,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KORD": {
+          "source": "checkwx",
+          "obs_age_s": 1322.7,
+          "temp_c": 23.3,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KSEA": {
+          "source": "checkwx",
+          "obs_age_s": 1202.7,
+          "temp_c": 13.3,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "KSFO": {
+          "source": "checkwx",
+          "obs_age_s": 1022.7,
+          "temp_c": 16.7,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "LEMD": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 31.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "LFPB": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 24.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "LIMC": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 25.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "LLBG": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 30.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "LTAC": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 30.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "LTFM": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 24.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "MMMX": {
+          "source": "checkwx",
+          "obs_age_s": 1382.7,
+          "temp_c": 17.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "MPMG": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 31.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "NZWN": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 10.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "OEJN": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 33.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "OPKC": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 28.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "RCSS": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 27.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "RJTT": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 21.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "RKPK": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 21.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "RKSI": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 21.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "RPLL": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 28.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "SAEZ": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 18.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "SBGR": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 23.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "UUWW": {
+          "source": "awc",
+          "obs_age_s": 722.7,
+          "temp_c": 14.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "VILK": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 29.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "WMKK": {
+          "source": "checkwx",
+          "obs_age_s": 2582.7,
+          "temp_c": 27.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "WSSS": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 26.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZBAA": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 17.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZGGG": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 28.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZGSZ": {
+          "source": "checkwx",
+          "obs_age_s": 15182.7,
+          "temp_c": 31.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZHCC": {
+          "source": "checkwx",
+          "obs_age_s": 4382.7,
+          "temp_c": 19.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZHHH": {
+          "source": "checkwx",
+          "obs_age_s": 4382.7,
+          "temp_c": 23.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZSPD": {
+          "source": "checkwx",
+          "obs_age_s": 782.7,
+          "temp_c": 25.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZSQD": {
+          "source": "checkwx",
+          "obs_age_s": 4382.7,
+          "temp_c": 23.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZUCK": {
+          "source": "checkwx",
+          "obs_age_s": 4382.7,
+          "temp_c": 22.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        },
+        "ZUUU": {
+          "source": "checkwx",
+          "obs_age_s": 4382.7,
+          "temp_c": 21.0,
+          "fetched_this_cycle": true,
+          "fields_ok": true
+        }
+      }
+    },
+    "books": {
+      "cached_tokens": 2326,
+      "oldest_age_s": 14240.3,
+      "per_token_sample": {
+        "48190857149475067586434698021262207855987610873893164287704332528668961427270": 62.1,
+        "103943914659529195061071452646762345467567034311991410855935869210630093468689": 62.1,
+        "102734479711708111148595515982613760445620116412874897805213890463802281781601": 62.1,
+        "6937526068406686826076381905503607623852695771362710566733849105204640309897": 62.2,
+        "22524936964899112893868018167581958500563544524242932404403260135020114571171": 62.1,
+        "77933501321951340486275711186335782631805475089924267601111234813550324300939": 62.1
+      }
+    },
+    "websocket_market": {
+      "deployed": true,
+      "mode": "ws_seed_live",
+      "connected": true,
+      "connect_count": 11,
+      "reconnect_count": 9,
+      "message_count": 6448308,
+      "event_count": 0,
+      "subscribed_tokens": 2332,
+      "last_event_at": 1789139583.089296,
+      "connect_errors": 0
+    },
+    "clob": {
+      "mode": "read_only",
+      "submits_orders": false
+    },
+    "gamma": {
+      "mode": "public_read_only",
+      "events_discovered": 49
+    },
+    "signal_latency_s": {
+      "not_yet_fired": true
+    }
+  }
+}
