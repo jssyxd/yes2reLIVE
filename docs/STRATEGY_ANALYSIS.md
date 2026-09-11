@@ -101,13 +101,26 @@ t=8000ms:  预算超时，强制停火撤退 (abort_timeout)
 为彻底杜绝诱多假突破造成的毁灭性本金损失，系统在代码与风控门禁层树立了不可动摇的**底层铁律**：
 
 > **核心铁律**：  
-> **仅当 YES 腿最优卖价严格落在 `(0.48, 0.90]` 左开右闭区间时，才允许以 FAK 形式吃单！**  
-> **凡不在 `(0.48, 0.90]` 带内（即 `ask <= 0.48` 或 `ask > 0.90`），必须坚决彻底放弃买入（弃单，`below_floor` / `abort_above_cap`），绝对不允许降级为被动挂单（Maker / `post_only`）去盘口接盘！**
+> **仅当 YES 腿最优卖价严格落在 `(yes_min_ask, yes_max_ask]` 左开右闭区间（默认 `(0.48, 0.90]`）时，才允许以 FAK 形式吃单！**  
+> **凡不在带内（即 `ask <= yes_min_ask` 或 `ask > yes_max_ask`），必须坚决彻底放弃买入（弃单，零下单），绝对不允许降级为被动挂单（Maker / `post_only`）去盘口接盘！**
+
+> **口径（2026-09-12 修正）**：区间值是**配置驱动**的（`config/yes2re_reversal.json` 的
+> `yes_min_ask` / `yes_max_ask`，默认 `0.48` / `0.90`），且该铁律只在 **live 执行门禁层**实施 ——
+> **paper 计划层（`re_execution.py`）保持基线行为不变**（此前一轮曾把 `0.48/0.90` 硬编码进共享计划层，
+> 污染 paper 成交与 `tests_fill_gate.py`，已回滚）。
 
 ### 为什么坚决不允许降级为被动挂单？
 1. **假突破必然伴随低价诱多**：在多伦多实战中，做市商预测气温将深跌至 12°C，因此对 16°C 桶 YES 的估值极低，仅在 0.40 出货。如果此时系统误以为“不在带内就做被动挂单”，在 0.38 挂买单接盘，做市商将立即砸盘成交，随后该合约归零至 0.001，直接导致 **100% 本金灭顶亏损**！
 2. **气象反转是左侧风险、右侧交易**：只有当预测市场的主力流动性对突破形成共识、价格冲上 0.48 以上时，胜率才具备统计学优势。低于 0.48 时去挂单接盘是典型的“飞蛾扑火”。
 3. **技术强制保障**：
-   - 在 [`re_execution.py`](../re_execution.py) 计划层：`ask <= 0.48` 直接返回 `below_floor`（跳过并不生成订单意图）。
-   - 在 [`live/port.py`](../live/port.py) 执行门禁层：YES 腿若 `limit <= 0.48` 或非 FAK 吃单试图传 `post_only=True`，门禁立即拒单（`denied_yes_maker` / `denied_yes_floor`），绝无挂单可能。
+   - 在 [`live/port.py`](../live/port.py) **执行门禁层（唯一实施点）**：YES 腿自身最优卖价不在
+     `(yes_min_ask, yes_max_ask]` 内 ⇒ `order_mode=skip` + **零下单**（`execute_leg` 调用数 0），
+     状态码 `yes_price_below_band` / `yes_price_above_band`；无价格证据 / cap 不可用 / 区间值非法
+     ⇒ 同样拒单（`yes_price_unknown` / `taker_cap_missing` / `yes_band_unparsed`）。
+   - 在 [`live/v2_transport.py`](../live/v2_transport.py) **执行硬化（与调用方无关）**：`taker=True` 强制
+     `post_only=False` + `OrderType.FAK`；cap 非法 / 限价越界 / tick 未对齐一律**拒单**（不追价、不挪价）。
+   - 公开 API **不存在**"让 YES 腿降级为被动单"的入口：`LivePort.match` 只在两条腿各自通过时发 FAK，
+     否则什么都不发；被动 maker 分支只留给 `live/smoke.py` 的诊断闭环。
+   - paper 侧不改动：计划层仍按 leg 自带的 `floor`/`cap`（由策略按配置填入）规划，`tests_fill_gate.py`
+     与基线逐行一致。
 

@@ -1320,6 +1320,7 @@ def _stub_clob_types():
 
     class OrderType:
         GTC = "GTC"
+        FAK = "FAK"
 
     class ApiCreds:
         def __init__(self, *args):
@@ -1527,6 +1528,118 @@ def test_port_live_limits_read_live_env():
     live_status = port.port_status({"mode": "live"}, env=env)
     assert live_status["ok"] is False and live_status["limits"] == limits, live_status
     assert not any(v is None for v in live_status["limits"].values())
+
+
+def test_live_taker_rule_transport_level():
+    """The take rule at the transport level: FAK + post_only=False + price untouched, the
+    passivity check skipped *only* for the taker path, no GTC fallback for FAK, and the L-2/L-3
+    defences (explicit ``0 < cap <= 1``, absolute ``(0, 1]`` limit) enforced by the transport
+    itself.  The port never sends a passive order at all (see ``tests_port.py``)."""
+    client = _SmokeClient(status="matched", size_matched="6")
+    good = submit.gate_status(enable_submit=True, env={"LIVE_SUBMIT_ENABLED": "1"},
+                              confirm=submit.phrase())
+    crossing = {"best_ask": "0.83", "best_bid": "0.80", "tick_size": "0.01", "neg_risk": True}
+    seen: list = []
+
+    def _spy(**kwargs):
+        seen.append(kwargs)
+        return {"ok": False, "reason": submit.NM_VIOLATION, "detail": "spy: would cross"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        with _stub_clob_types(), _audit_path(log):
+            saved = submit.check_non_marketable
+            submit.check_non_marketable = _spy
+            try:
+                taker = v2_transport.execute_leg(
+                    client, token_id="TOK-1", side="BUY", price="0.83", size="10", book=crossing,
+                    gates=good, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None)
+                assert seen == [], "the taker path must not consult the passivity check"
+                maker = v2_transport.execute_leg(
+                    client, token_id="TOK-1", side="BUY", price="0.83", size="10", book=crossing,
+                    gates=good, clamp=False, poll_attempts=2, sleep=lambda _s: None)
+            finally:
+                submit.check_non_marketable = saved
+            lines = _audit_lines(log)
+    # the taker went out: FAK, post_only=False and the limit was NOT pressed below best_ask
+    assert taker["ok"] is True and taker["order_mode"] == "taker", taker
+    assert taker["order_type"] == "FAK" and taker["limit_price"] == "0.83", taker
+    assert taker["clamped"] is False and taker["fill_and_kill"] is True, taker
+    assert taker["filled_shares"] == Decimal("6") and taker["unfilled"] == Decimal("4"), taker
+    posts = [call for call in client.calls if call[0] == "post_order"]
+    assert posts[-1][2] == "FAK" and posts[-1][3] is False, posts
+    intent = [line for line in lines if line["action"] == "intent"][0]
+    assert intent["params"]["order_mode"] == "taker" and intent["params"]["order_type"] == "FAK", intent
+    assert intent["params"]["post_only"] is False, intent
+    # ... while the (diagnostics-only) maker path still runs the passivity check and is refused
+    assert len(seen) == 1, seen
+    assert maker["ok"] is False and maker["status"] == submit.NM_VIOLATION, maker
+    assert maker["order_mode"] == "maker", maker
+
+    # L-2: no usable cap ⇒ refuse.  The transport refuses on its own, whatever the caller did.
+    with tempfile.TemporaryDirectory() as tmp, _stub_clob_types():
+        before = list(client.calls)
+        for bad_cap in (None, "", "abc", "0", "1.5"):
+            uncapped = v2_transport.execute_leg(
+                client, token_id="TOK-1", side="BUY", price="0.83", size="10", book=crossing,
+                gates=good, taker=True, cap=bad_cap, poll_attempts=2, sleep=lambda _s: None,
+                audit_path=Path(tmp) / "a.jsonl")
+            assert uncapped["ok"] is False and uncapped["status"] == "taker_cap_required", uncapped
+        assert client.calls == before, client.calls
+
+    # L-3: limit > 1 and limit > cap are refused rather than described to the venue
+    with tempfile.TemporaryDirectory() as tmp, _stub_clob_types():
+        before = list(client.calls)
+        over_one = v2_transport.execute_leg(
+            client, token_id="TOK-1", side="BUY", price="1.5", size="10", book=crossing,
+            gates=good, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+            audit_path=Path(tmp) / "a.jsonl")
+        assert over_one["status"] == "price_out_of_range", over_one
+        over_cap = v2_transport.execute_leg(
+            client, token_id="TOK-1", side="BUY", price="0.93", size="10", book=crossing,
+            gates=good, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+            audit_path=Path(tmp) / "a.jsonl")
+        assert over_cap["status"] == "above_cap", over_cap
+        assert client.calls == before, client.calls
+
+    # no FAK in the SDK ⇒ refuse; never quietly send a marketable GTC that could rest
+    with tempfile.TemporaryDirectory() as tmp, _stub_clob_types():
+        import py_clob_client_v2.clob_types as types_mod
+        saved_ot = types_mod.OrderType
+        try:
+            class _NoFak:
+                GTC = "GTC"
+
+            types_mod.OrderType = _NoFak
+            before = list(client.calls)
+            refused = v2_transport.execute_leg(
+                client, token_id="TOK-1", side="BUY", price="0.83", size="10", book=crossing,
+                gates=good, taker=True, cap="0.90", poll_attempts=2, sleep=lambda _s: None,
+                audit_path=Path(tmp) / "a.jsonl")
+        finally:
+            types_mod.OrderType = saved_ot
+    assert refused["status"] == "no_fak_order_type" and refused["ok"] is False, refused
+    assert client.calls == before, client.calls
+
+    # the port-side rule the transport obeys: half-open (0.48, 0.90] on the YES leg's own price,
+    # leg-level gates, and no passive mode on the trading path
+    lo, hi = Decimal("0.48"), Decimal("0.90")
+    assert (port.MAKER, port.TAKER, port.SKIP) == ("maker", "taker", "skip")
+    assert (port.GATE_YES_BAND, port.GATE_NO_LEG_ASK) == ("yes_band", "no_leg_ask")
+    for raw, want in (("0.479", False), ("0.480", False), ("0.4801", True),
+                      ("0.8999", True), ("0.9000", True), ("0.9001", False)):
+        assert port.in_yes_band(raw, lo, hi) is want, raw
+    assert port.yes_price_band({}) == {"ok": True, "lo": lo, "hi": hi, "detail": "(0.48, 0.90]"}
+    assert port.best_ask_of({"best_ask": "0.62"}) == Decimal("0.62")
+    assert port.best_ask_of({"best_ask": None}) is None and port.best_ask_of(None) is None
+    assert port.is_yes_leg({"leg": "buy_yes_new"}) is True
+    assert port.is_yes_leg({"leg": "buy_yes_sleeve", "outcome": "YES"}) is True
+    assert port.is_yes_leg({"leg": "buy_no_broken", "outcome": "NO"}) is False
+    # an explicit cap is mandatory for a take: 0 < cap <= 1
+    assert port.taker_cap_number("0.90") == Decimal("0.90")
+    assert port.taker_cap_number("1.0") == Decimal("1.0")
+    for bad in (None, "", "abc", "0", "-0.5", "1.5", "NaN", True):
+        assert port.taker_cap_number(bad) is None, bad
 
 
 # --------------------------------------------------------------------------- Phase 3: bucket selection
@@ -2078,6 +2191,7 @@ CHECKS = [
     ("submit: shared gate validation is strict (F1)", test_shared_gate_validation_is_strict),
     ("port: reuses v1 gate/audit/checks", test_port_reuses_v1_safety_machinery),
     ("port: live limits come from LIVE_* env", test_port_live_limits_read_live_env),
+    ("taker: FAK/no-clamp, cap required, price bounds", test_live_taker_rule_transport_level),
     ("submit: triple gate matrix", test_submit_gate_matrix),
     ("submit: non-marketable check", test_submit_non_marketable),
     ("submit: per-order + cumulative limits", test_submit_limits),

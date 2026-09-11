@@ -39,6 +39,7 @@ else:  # `python3.13 tests_port.py` / `import live.v2_transport`
     from . import clob_client, creds as creds_mod, submit
 
 ZERO = Decimal("0")
+ONE = Decimal("1")
 
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
@@ -547,18 +548,94 @@ def average_fill_price(client, order_id: str, *, token_id: str | None = None) ->
     return (cost / shares).quantize(QTY)
 
 
+# --------------------------------------------------------------------------- execute one leg
+
+#: fill modes recorded in the audit log (``order_mode``) — one value per order
+MAKER_ORDER_MODE = "maker"
+TAKER_ORDER_MODE = "taker"
+
+#: the single ``post_order`` call site exists exactly once and serves both modes.  Taker is
+#: **FAK** (fill-and-kill: the unfilled remainder is voided server-side, nothing rests); maker
+#: keeps the historical **GTC**.  The literal GTC string is kept inline for the maker branch so
+#: that path stays byte-for-byte what it was.
+ORDER_TYPE_GTC = "GTC"
+ORDER_TYPE_FAK = "FAK"
+
+
+def _tick_of(book, tick) -> Decimal:
+    """Tick size for one leg: explicit ``tick``, else the book's, else the 1-cent default."""
+    raw = tick if tick is not None else ((book or {}).get("tick_size") if isinstance(book, dict) else None)
+    try:
+        return _dec(raw or "0.01", "tick", allow_zero=False)
+    except ValueError:
+        return Decimal("0.01")
+
+
+def _taker_cap(value) -> Decimal | None:
+    """The cap an aggressive order may lean on: an explicit ``0 < cap <= 1``.
+
+    ``None`` for missing / unparseable / non-positive / ``> 1`` (above the venue maximum).  A
+    missing cap must never authorise a taker.  ``cap == 1.0`` is accepted because that is the
+    shipped ``no_max_ask`` — with it the absolute ``<= 1`` limit is what actually binds.
+    (L-2/L-3: the last line of defence must not depend on the caller's good manners.)
+    """
+    try:
+        out = _dec(value, "cap", allow_zero=False)
+    except ValueError:
+        return None
+    return out if out <= ONE else None
+
+
+def _deny_audit(audit_path, reason: str, params: dict) -> bool:
+    """Audit a refusal of the **aggressive** direction (best effort).
+
+    A refusal is not a write, so — exactly like ``cancel_with_retry`` — a broken log must not
+    swallow the refusal; it is reported on stderr instead.  (The submit path itself keeps its
+    mandatory, fail-closed ``intent`` record: no audit ⇒ no order.)
+    """
+    try:
+        submit.audit({"actor": "live/v2_transport.py", "action": "deny", "reason": reason,
+                      "params": params}, path=audit_path)
+    except submit.AuditError as exc:
+        print(f"AUDIT FAILURE: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tick=None,
                 neg_risk: bool | None = None, gates: dict | None = None, post_only: bool = True,
-                order_type: str = "GTC", clamp: bool = True, poll_attempts: int = 6,
-                poll_sleep: float = 1.0, sleep=None, audit_path=None, take_down_unfilled: bool = True) -> dict:
-    """Place one order leg (passive maker or FAK taker) and reconcile the real fill.
+                clamp: bool = True, taker: bool = False, cap=None, poll_attempts: int = 6,
+                poll_sleep: float = 1.0, sleep=None, audit_path=None,
+                take_down_unfilled: bool = True, audit_extra: dict | None = None) -> dict:
+    """Place ONE limit order and reconcile the real fill. The submit never retries.
 
     ``gates`` must be a fully-passing gate record (``submit.gate_status``): the dangerous
     direction is unreachable without proof that all three gates were satisfied.
+
+    Two fill modes, one call site (``post_order``):
+
+    * ``taker=False`` (default) — **maker / passive**: refetch the book, ``clamp_limit`` the
+      price below the best ask (BUY) / above the best bid (SELL), ``post_only=True``,
+      ``OrderType.GTC`` — byte-for-byte the historical behaviour.
+    * ``taker=True`` — **taker / aggressive** (the operator's LIVE rule): the incoming limit is
+      used **as passed and never clamped down**, sent ``post_only=False`` with
+      ``OrderType.FAK`` (fill-and-kill → whatever does not fill is voided server-side; nothing is
+      left resting and no residual order is created).  The taker stays inside the same hard
+      limits: an explicit ``0 < cap <= 1`` is **required** (missing / unparseable / non-positive /
+      ``> 1`` ⇒ refuse ``taker_cap_required``), the leg's ask ``cap`` is *refused* (``above_cap``)
+      rather than chased, a limit outside ``(0, 1]`` is refused (``price_out_of_range``) and a
+      limit that is not tick-aligned is refused (``price_not_on_tick``) instead of being moved.
+      ``submit.check_non_marketable`` is skipped **by design** (an aggressive order is
+      marketable by definition) — that is exactly why the caller must gate the mode first.
+
+    ``audit_extra`` is merged into the ``intent``/``submit`` audit params so the caller's
+    fill-mode decision (``taker_gate`` / ``yes_price`` …) travels with the mandatory record.
     """
     out = {"ok": False, "status": "not_started", "order_id": None, "filled_shares": ZERO,
            "avg_price": None, "cost": ZERO, "unfilled": _safe_dec(size), "residual_risk": False,
-           "limit_price": None, "detail": "", "clamped": False}
+           "limit_price": None, "detail": "", "clamped": False,
+           "order_mode": TAKER_ORDER_MODE if taker else MAKER_ORDER_MODE,
+           "order_type": ORDER_TYPE_FAK if taker else ORDER_TYPE_GTC}
     if not submit.gates_all_passed(gates):
         submit.audit({"actor": "live/v2_transport.py", "action": "deny", "reason": "gates_missing",
                       "params": {"intent": "execute_leg", "token_id": str(token_id),
@@ -570,44 +647,82 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
     except ValueError as exc:
         return {**out, "status": "invalid_input", "detail": str(exc)}
 
-    reference = refetch_book(client, token_id) if clamp else None
-    if reference is None:
-        reference = book
-
-    if clamp:
+    extra_params: dict[str, Any] = dict(audit_extra or {})
+    lib = None
+    if taker:
+        # an aggressive order is never post-only, whatever the caller asked for
+        post_only = False
+        # the aggressive order type must really exist: silently falling back to GTC would leave a
+        # marketable order *resting* on the book (the one thing FAK exists to prevent)
+        lib = _py_clob_v2()
+        if getattr(lib["OrderType"], "FAK", None) is None:
+            _deny_audit(audit_path, "no_fak_order_type",
+                        {**extra_params, "token_id": str(token_id), "price": str(want),
+                         "size": str(shares)})
+            return {**out, "status": "no_fak_order_type",
+                    "detail": ("OrderType.FAK is unavailable in this SDK build — refusing to send "
+                               "an aggressive order as GTC (it could come to rest)")}
+        cap_dec = _taker_cap(cap)
+        if cap_dec is None:
+            # L-2: an aggressive order must carry its own ceiling.  Missing / unparseable /
+            # non-positive / >= 1 (a 1.0 cap is no ceiling) all refuse — never send uncapped.
+            _deny_audit(audit_path, "taker_cap_required",
+                        {**extra_params, "price": str(want),
+                         "cap": (str(cap) if cap is not None else None)})
+            return {**out, "status": "taker_cap_required",
+                    "detail": (f"taker refused: cap={cap!r} is not a usable ceiling "
+                               f"(need 0 < cap < 1)")}
+        if want > ONE or want <= ZERO:
+            # L-3: the taker path never re-prices, so an out-of-range limit must be refused here
+            _deny_audit(audit_path, "price_out_of_range",
+                        {**extra_params, "price": str(want), "cap": str(cap_dec)})
+            return {**out, "status": "price_out_of_range",
+                    "detail": f"taker limit {want} is outside (0, 1] — refuse"}
+        if want > cap_dec:
+            _deny_audit(audit_path, "above_cap",
+                        {**extra_params, "price": str(want), "cap": str(cap_dec)})
+            return {**out, "status": "above_cap",
+                    "detail": f"taker limit {want} > leg cap {cap_dec} — refuse, never chase"}
+        step = _tick_of(book, tick)
+        if step > ZERO and (want / step) != (want / step).to_integral_value():
+            _deny_audit(audit_path, "price_not_on_tick",
+                        {**extra_params, "price": str(want), "tick": str(step)})
+            return {**out, "status": "price_not_on_tick",
+                    "detail": (f"taker limit {want} is not a multiple of tick {step} — refuse "
+                               f"(the taker path never moves the price)")}
+        limit = want
+        out.update({"limit_price": str(limit), "clamped": False})
+    else:
+        reference = refetch_book(client, token_id) if clamp else None
+        if reference is None:
+            reference = book
         clamped = clamp_limit(side=side, limit=want, book=reference, tick=tick)
         if not clamped["ok"]:
             return {**out, "status": clamped["reason"], "detail": clamped["detail"]}
         limit, step = clamped["price"], clamped["tick"]
         out.update({"limit_price": str(limit), "clamped": bool(clamped["clamped"])})
-    else:
-        raw_tick = tick if tick is not None else (reference or {}).get("tick_size") if isinstance(reference, dict) else None
-        step = _dec(raw_tick or "0.01", "tick", allow_zero=False)
-        limit = (want / step).to_integral_value(rounding=ROUND_DOWN) * step
-        out.update({"limit_price": str(limit), "clamped": False})
-
-    if post_only:
         passive = submit.check_non_marketable(side=side, price=limit, book=reference)
         if not passive["ok"]:
             return {**out, "status": passive["reason"], "detail": passive["detail"]}
-    else:
-        # Taker / FAK order: price sanity check
-        if limit <= ZERO or limit > Decimal("1.0"):
-            return {**out, "status": "invalid_price", "detail": f"price {limit} out of (0, 1]"}
 
     params = {"token_id": str(token_id), "side": side, "price": str(limit), "size": str(shares),
-              "clamped": bool(out.get("clamped")), "post_only": post_only, "order_type": order_type}
+              "clamped": bool(out["clamped"]), "post_only": post_only}
+    params.update(extra_params)
+    # the computed mode/type are authoritative: they can never be spoofed through ``audit_extra``
+    params["order_mode"] = out["order_mode"]
+    params["order_type"] = out["order_type"]
     submit.audit({"actor": "live/v2_transport.py", "action": "intent", "reason": "execute_leg",
                   "params": params}, path=audit_path)
 
-    lib = _py_clob_v2()
+    if lib is None:
+        lib = _py_clob_v2()
     args = lib["OrderArgs"](token_id=str(token_id), price=float(limit), size=float(shares), side=side)
     options = lib["PartialCreateOrderOptions"](tick_size=str(step),
                                                neg_risk=bool(neg_risk) if neg_risk is not None else None)
     signed = client.create_order(args, options)
+    order_type = lib["OrderType"].FAK if taker else lib["OrderType"].GTC
     try:
-        c_order_type = getattr(lib["OrderType"], order_type, lib["OrderType"].FAK) if order_type == "FAK" else lib["OrderType"].GTC
-        response = client.post_order(signed, c_order_type, post_only=post_only)
+        response = client.post_order(signed, order_type, post_only=post_only)
     except Exception as exc:  # noqa: BLE001 - the order may or may not have landed
         detail = f"{type(exc).__name__}: {exc}"
         submit.audit({"actor": "live/v2_transport.py", "action": "exception", "reason": "submit_failed",
@@ -632,12 +747,22 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
               "unfilled": (shares - filled) if filled <= shares else ZERO,
               "terminal": fill.get("terminal"), "response_summary": summary,
               "detail": fill.get("detail", "")}
+    if taker:
+        # FAK evidence for the engine/report: the remainder was voided, not left resting. A FAK
+        # order is terminal as soon as it is answered, so the take-down below normally does not
+        # fire; it stays armed as the defensive net in case a fill ever reports a resting state.
+        result["fill_and_kill"] = True
+        result["voided_shares"] = result["unfilled"]
 
-    # the engine wants "fill now or stand down":
-    # for FAK orders, Polymarket server automatically kills any unfilled remainder;
-    # for GTC orders, cancel unfilled remainder here.
-    needs_takedown = (order_type != "FAK") and take_down_unfilled and (shares - filled) > ZERO \
-        and str(fill["status"]).lower() not in ("cancelled", "canceled")
+    # the engine wants "fill now or stand down", so the unfilled remainder is taken down here;
+    # the smoke order deliberately keeps it resting so the place→query→cancel loop can be tested.
+    # For a taker order the FAK answer is terminal: the remainder was voided server-side, so a
+    # cancel would be pointless *and* would report false residual risk. The net stays armed for
+    # the one case that matters — a taker order that somehow reports a resting state.
+    fill_status = str(fill["status"]).lower()
+    needs_takedown = take_down_unfilled and (shares - filled) > ZERO \
+        and fill_status not in ("cancelled", "canceled") \
+        and not (taker and fill_status in TERMINAL_STATUSES)
     if needs_takedown:
         takedown = cancel_with_retry(client, order_id, sleep=sleep, audit_path=audit_path)
         result["cancel"] = takedown

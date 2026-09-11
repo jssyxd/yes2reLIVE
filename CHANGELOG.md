@@ -1,5 +1,47 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-12 — live 腿级吃单落地（严格弃单 + 带值读 config + taker 硬化）+ **恢复 paper 计划层**
+
+- **live 吃单：腿级独立判定，且交易路径绝无被动回退**（`live/port.py`）：
+  * **YES 腿**（`buy_yes_new` / `buy_yes_sleeve` / `outcome == "YES"`）仅当**自身**最优卖价落在
+    `(yes_min_ask, yes_max_ask]`（默认 `0.48` / `0.90`，左开右闭）时才以 **FAK** 吃单；
+    **带外 ⇒ 零下单**（`order_mode=skip`、`execute_leg` 调用数 **0**、无 `post_only=True` 提交），
+    **绝不降级为被动挂单接盘**（假突破处挂单会以买价成交、买下即将归零的桶）；无价格证据 /
+    无可用 cap / 区间值非法 ⇒ 一律**拒单**。
+  * **NO 腿**（任何非 YES 腿）以**自身 cap + 自身盘口深度**为唯一判据：有卖单 ⇒ FAK（cap 原样转发，
+    `no_max_ask = 1.0` 时由绝对 `<= 1` 上限兜底）；无卖单 ⇒ `no_book` 跳过；**不随 YES 腿带内/带外改变**。
+  * `LivePort.match` **不再产生任何被动订单**；`live/v2_transport.execute_leg` 的 maker 分支只保留给
+    `live/smoke.py` 的诊断闭环，交易路径永不使用。
+- **taker 硬化（与调用方无关的最后一道防线）**（`live/v2_transport.py`）：`taker=True` ⇒ `post_only=False`
+  + `OrderType.FAK`（SDK 无 FAK ⇒ **拒**，绝不退化成会挂住的 GTC）；cap 缺失/不可解析/`<= 0`/`> 1`
+  ⇒ `taker_cap_required`；限价 `<= 0` / `> cap` / `> 1` ⇒ `price_out_of_range` / `above_cap`（**拒单，不追价**）；
+  tick 未对齐 ⇒ `price_not_on_tick`（**拒单，不挪价**）；FAK 终态 ⇒ 余量由交易所作废
+  （结果带 `fill_and_kill` / `voided_shares`），不再把已作废余量误报成 residual risk。
+- **带值改读 config**：`yes_min_ask` / `yes_max_ask` 从 `cfg`（平铺键或 `cfg["strategy"]`）读取，
+  缺失才回落默认 `0.48` / `0.90`；**非法值 fail-closed 拒单**，不再硬编码。
+- **恢复 paper 计划层（修上一轮回归）**：`re_execution.py` 回到基线 `cad5e30`（md5 前 12 位
+  `01c599878a35`）。上一轮把 `0.48/0.90` 硬编码进 **paper 共享的计划层**，后果是
+  `tests_fill_gate.py` FAIL（`no floor -> cheap ask still fills`）且 paper 成交行为漂移
+  （`paper_reversal_sim --scenarios-only`：`buy_yes_new` 0.17 → 10.42 股、`send_faks` 6 → 3）。
+  现在 paper **逐行回到基线**：`tests_fill_gate.py` 恢复 PASS，sim 输出与 `cad5e30` **逐字节一致**，
+  `tests_reversal.py` / `tests_sleeve_signal.py` / `tests_sleeve_wiring.py` 与基线逐行一致。
+  区间语义只存在于 **live 执行门禁层**（`live/port.py`），paper 计划层保持原样。
+- **审计不被纯决策污染**：决策字段（`order_mode` / `taker_gate` / `yes_price` / `yes_price_source`）
+  **并入强制 `intent` / `submit` 行**——未下单的纯决策**不新增**日志行，`submit.py --summary` 的
+  action 计数不变。
+- **诊断措辞修正（审计 LOW）**：`live/port.py` 中"有报价但不可用"（非数字 / `<= 0` / `> 1`）原先与
+  "真的没有卖单"共用 `no_book`，会把人引向"缺数据源"而非"报价坏掉"；现独立为
+  **`ask_out_of_range`**（两者仍然都是**零下单**）。
+- 测试：`tests_port.py` **29/29**（腿级桩计数矩阵 `0.40`/`0.479`/`0.48`/`0.9001`/`0.99` ⇒ 0 次下单且
+  全程无 `post_only=True`；`0.4801`/`0.60`/`0.8999`/`0.90` ⇒ 恰 1 次 `taker=True` / `post_only=False` /
+  未夹价；NO 腿独立性；cfg 驱动；taker 硬化；三重闸门与 `risk_gate`/`check_limits` 红线；审计不污染；
+  坏报价 reason），`tests_live.py` **51/51**；`tests_reversal` / `tests_fill_gate` / `tests_sleeve_*` 全 PASS；
+  测试一律把审计路径重定向到临时文件，**仓库内零真实 submit/cancel**（无 `data/live_events.jsonl`）。
+- 文档：`live/README.md` 更新下单语义；`ops/PENDING.md` 记录 `no_max_ask` 实配 `1.0` vs `AGENTS.md`
+  文档 `0.65` 的口径差（**操作者决定保留 1.0**，不做静默"修正"）；`docs/STRATEGY_ANALYSIS.md` §5
+  修正为"带值判定在 live 执行层，paper 计划层不含硬编码区间"。
+
+
 ## 2026-09-11 — 运维文档（ops/PENDING.md 待办单一清单）+ LIVE 真实验收记录
 
 - 新增 **`ops/PENDING.md`**：双实例全貌（paper / LIVE）、**4 个待决策项**（LIVE 闸门开启 / config 600 vs 账本 500 / `miami no_book` 永久锁是否重试 / LIVE 结算 claim 未实现）、**5 个 LIVE 技术待办**（账本初始资金对齐真实余额 / my155 WS down / 撤单后列表延迟 / 真实订单运维流程含事故复盘 / 资金规模）、paper 历史遗留、环境变量对照表、安全红线。

@@ -322,9 +322,10 @@ leg sizing / 状态 schema / 事件 / 健康文件 / 结算记账，只把"怎�
 _r_cycle._paper_fire(...)                  ← 同一段 ladder / 记账 / 建档逻辑 (未改策略)
         │
         ├─ port.preflight(fire, cfg)       ← paper: 恒允许；live: 真实余额/持仓 + LIVE_* 硬上限
-        ├─ port.match(leg, book, limit, shares)
+        ├─ port.match(leg, book, limit, shares, fire=…, cfg=…)
         │        ├─ PaperPort : re_execution.paper_match_fak   (in-memory FAK, 逐字不变)
-        │        └─ LivePort  : live/v2_transport.execute_leg  (真实 CLOB v2 下单 + 成交对账)
+        │        └─ LivePort  : live/v2_transport.execute_leg  (真实 CLOB v2 **FAK 吃单** + 成交对账；
+        │                        带外/无盘口/无 cap ⇒ 零下单，绝无被动回退)
         └─ port.fund(state, cfg, fire, total_cost)   ← 两种模式都用 paper_capital.reserve 记同一本账
 ```
 
@@ -415,10 +416,35 @@ paper 与 live 实例**共用同一个** `config/yes2re_reversal.json`，避免�
   想手工撤单请用 `live/submit.py --cancel-order <id>` 或 `live/v2_transport.py --cancel-order <id>`。
 - 闸门 / 审计（`data/live_events.jsonl`，含拒绝）/ `check_non_marketable` / `check_limits` 全部**复用**
   `live/submit.py` 的实现（同一函数对象），v2 不另起一套。
-- 下单：`post_only=True` + **提交前重取盘口夹紧**（BUY ≤ `best_ask − tick`、SELL ≥ `best_bid + tick`，
-  仍须被动）；下单**不重试**（重试会双开）。
+- 下单（**2026-09-12 起 = 腿级吃单**，见下节）：交易路径走 **FAK taker**（`post_only=False`、
+  价格**不夹紧**、不追价、不挪 tick）；`post_only=True` + 提交前重取盘口夹紧的**被动分支只保留给
+  `live/smoke.py` 的诊断闭环**，交易路径永不使用。两条路径下单**都不重试**（重试会双开）。
 - 成交对账：轮询 `get_order` + `get_trades` 至终态或超时，把**真实成交量/均价**回报给引擎；
 - 撤单：`cancel_orders([id])` **失败重试 3 次**，仍失败 → 结果带 `residual_risk=True` 并写审计。
+
+### LIVE 吃单规则：腿级独立判定 + 绝不被动回退（2026-09-12）
+
+> 动机（2026-09-11 多伦多/华沙实战）：live 原先只下被动单，**纸面成交而实盘零成交**；而"带外就改挂被动单"
+> 更危险 —— 假突破处的被动买单会以买价成交，直接买下即将归零的桶（多伦多 YES → 0.001，华沙 −69%）。
+> 规则因此是两句话：**两腿各自独立判定**，且**任何不满足条件的情形都是弃单，绝不降级**。
+
+| 腿 | 判据（只看自己这一腿） | 满足 ⇒ | 不满足 ⇒ |
+|----|------------------------|--------|----------|
+| **YES 腿**（`buy_yes_new` / `buy_yes_sleeve` / `outcome == "YES"`） | 自身最优卖价 ∈ `(yes_min_ask, yes_max_ask]`（默认 `0.48` / `0.90`，左开右闭；读 `cfg` 平铺键或 `cfg["strategy"]`） | **FAK 吃单**（`taker`） | **零下单**（`skip`）：`yes_price_below_band` / `yes_price_above_band` / `yes_price_unknown` / `taker_cap_missing` / `yes_band_unparsed` |
+| **NO 腿**（任何非 YES 腿） | **自身** cap（`no_max_ask`，实配 `"1.0"`）+ **自身**盘口有卖单 | **FAK 吃单**（cap 原样转发；`cap = 1.0` 时由绝对 `<= 1` 上限兜底） | 无卖单 ⇒ `no_book` 跳过；报价存在但非法（非数字/`<=0`/`>1`）⇒ `ask_out_of_range` |
+
+* **腿级独立**：YES 带内/带外**不改变** NO 腿的判定，反之亦然（各有自己的 `taker_gate`：`yes_band` / `no_leg_ask`）。
+* **无被动回退**：`LivePort.match` 在交易路径上**永不**产生 `post_only` 订单；每一次拒单/跳过都**零下单**。
+* **带值来自 config**：改 `config/yes2re_reversal.json` 的 `yes_min_ask` / `yes_max_ask` 立即生效（单测覆盖）；
+  **值非法**（缺上下界关系、非数字、`<= 0`、`> 1`）⇒ `yes_band_unparsed`，**整条 fire 一律弃单**（fail-closed）。
+* **硬化在执行层**：即使调用方传错，`live/v2_transport.execute_leg(taker=True, …)` 也会自己拒绝 —— 无可用
+  cap、限价越界（`<=0` / `>cap` / `>1`）、tick 未对齐、SDK 无 `OrderType.FAK`，全部**拒单而不是"修正"**。
+* **审计不因纯决策膨胀**：`order_mode` / `taker_gate` / `yes_price` / `yes_price_source` 并入既有
+  `intent` / `submit` 行；没下出去的决策**不写日志**，`live/submit.py --summary` 计数不受影响。
+
+> ⚠ **口径差（保留，不静默修改）**：`config/yes2re_reversal.json` 实配 `no_max_ask = "1.0"`，而
+> `AGENTS.md` 文档写的是 NO cap `0.65`。操作者明确要求"其余不变"，因此**保留 1.0**；此时 NO 腿的唯一
+> 上限是绝对 `<= 1`。差异已记入 `ops/PENDING.md`。
 
 ### 已知限制（Phase 3b）
 
@@ -426,10 +452,12 @@ paper 与 live 实例**共用同一个** `config/yes2re_reversal.json`，避免�
 2. 真实成交的**手续费/返佣**未入账（`paper_capital` 只记成本）；Phase 4 需要时按 `get_trades` 的
    `fee_rate_bps` 扩展。
 3. `poll_fill` 的均价优先取 `get_trades`（按 orderID 归属），取不到时退化为订单限价。
-4. 部分成交后剩余量的撤单依赖 `cancel_orders`；服务端极端情况下可能已成交（`post_only` 下概率极低），
+4. 部分成交后的余量：**taker（FAK）** 由交易所在应答时直接作废（结果带 `fill_and_kill` / `voided_shares`），
+   不再误报残留；**maker（仅冒烟诊断路径）** 仍依赖 `cancel_orders`，服务端极端情况下可能已成交，
    此时 `residual_risk` 会明确标注。
 5. paper 与 live 共用同一本账（`paper_total_debit_usdc`）——live 模式下它就是真实支出账本；
    两模式**不要混跑**同一份 state。
+6. LIVE 吃单的最高价由**绝对 `<= 1`** 兜底；`no_max_ask = 1.0` 时该绝对上限就是 NO 腿唯一的顶（见上方口径差）。
 
 ## 阶段梯子
 

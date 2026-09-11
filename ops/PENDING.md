@@ -1,7 +1,7 @@
 # 待处理事项（PENDING） — weatherbotyes2re paper + LIVE
 
 > 维护约定：本文件是**未完成/待决策/已知异常**的单一清单。每项含：现状 → 影响 → 待办/决策点 → 相关文件。
-> 最后更新：2026-09-11 01:20 CST（UTC 17:20）· HEAD `95b1660` + 本轮 3b-4 改动
+> 最后更新：2026-09-12 · HEAD `8022ca3` + 本轮腿级 taker / 恢复 paper 计划层改动（本地 commit，**未 push**）
 > 相关日志：`ops/repair_log.md`（paper healer）、`ops/repair_log_live.md`（LIVE healer）
 
 ---
@@ -87,6 +87,27 @@
 ### T-5. 资金规模与并发
 - 真实余额 51.713622 USDC；预算 12/笔 → 最多 4 个并发 fire；`LIVE_MAX_OPEN_POSITIONS=10` 实际受资金约束。
 - 待办：如需放量，入金并同步调整 `LIVE_MAX_CAPITAL_USDC` / `YES2RE_FIRE_BUDGET_USDC`。
+
+### T-6. LIVE 吃单已改腿级判定（2026-09-12 落地，待部署 + 待真实 fire 观察）
+- **现状（本地已实现并验证，尚未部署到 my155）**：
+  * **YES 腿**仅在自身最优卖价 ∈ `(yes_min_ask, yes_max_ask]`（默认 `0.48` / `0.90`，**读 config**）时
+    以 **FAK** 吃单；**带外 ⇒ 零下单**（`order_mode=skip`、`execute_leg` 调用数 0），**绝无被动回退**
+    （旧行为是把 ladder 意图一律变 `post_only` 被动单，实盘结构性零成交；"带外改挂被动单"更会以买价
+    接下即将归零的桶 —— 2026-09-11 多伦多 YES→0.001 / 华沙 −69%）。
+  * **NO 腿**只看**自身 cap + 自身盘口**：有卖单 ⇒ FAK；无卖单 ⇒ `no_book` 跳过；**不随 YES 腿带内/带外改变**。
+  * **paper 计划层不动**：`re_execution.py` 已回到基线 `cad5e30`（上一轮把 `0.48/0.90` 硬编码进共享计划层，
+    导致 `tests_fill_gate.py` FAIL 与 `paper_reversal_sim --scenarios-only` 输出漂移；现已逐行回到基线）。
+  * 验证：`tests_port.py` 29/29、`tests_live.py` 51/51、`tests_reversal` / `tests_fill_gate` / `tests_sleeve_*`
+    全 PASS，`paper_reversal_sim --scenarios-only` 与 `cad5e30` 逐字节一致。
+- **待办**：
+  1. 部署到 my155（拉取 commit 后重启 `yes2re-live`），并在**真实 fire** 后核对
+     `data/live_events.jsonl`：`order_mode` / `taker_gate` / `yes_price` 是否与盘口一致、有无意外 `post_only`。
+  2. 首个真实 FAK 成交后核对 `fill_and_kill` / `voided_shares` 与账户实际成交/余额。
+  3. **尚未经过真实资金 taker 成交验证**（此前只有 post-only 冒烟单 0 成交），风险等级高于普通改动。
+- **口径差（保留，按操作者决定）**：`config/yes2re_reversal.json` 实配 `no_max_ask = "1.0"`，而 `AGENTS.md`
+  第 36/75/92 行文档写 NO cap `0.65`。操作者要求"其余不变"⇒ **保留 1.0**，NO 腿唯一顶为绝对 `<= 1`。
+  同时 `AGENTS.md` 记的 YES cap `0.48` 与实配 `yes_max_ask = "0.9"` + `yes_min_ask = "0.48"` 也不一致
+  （实配是**区间**，不是单边 cap）。**若要让文档与实配一致，需操作者确认后单独一轮改 `AGENTS.md`。**
 
 ---
 

@@ -63,55 +63,30 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
         return {"status": "abort_timeout", "leg": leg.get("leg"), "token_id": token, "cap": str(cap), "elapsed_ms": elapsed_ms, "budget_ms": budget_ms, "unfilled": str(target_shares)}
     if ask is None:
         return {"status": "no_book", "leg": leg.get("leg"), "token_id": token, "cap": str(cap), "elapsed_ms": elapsed_ms, "note": "no_resting_ask_in_ladder"}
-    # Check if this is the YES leg: strictly only fill when YES in (0.48, 0.90]
-    # 不在 (0.48, 0.90] 区间坚决彻底放弃买入（弃单），严禁降级为被动挂单接盘！
-    is_yes = (str(leg.get("outcome") or "").upper() == "YES") or (str(leg.get("leg") or "") == "buy_yes_new")
-    if is_yes:
-        floor = Decimal("0.48")
-        cap = Decimal("0.90")
-        if ask <= floor:
-            return {
-                "status": "below_floor",
-                "leg": leg.get("leg"),
-                "token_id": token,
-                "best_ask": str(ask),
-                "floor": str(floor),
-                "cap": str(cap),
-                "elapsed_ms": elapsed_ms,
-                "note": "yes_below_floor_strictly_abandon_never_maker",
-            }
-        if ask > cap:
-            return {
-                "status": "abort_above_cap",
-                "leg": leg.get("leg"),
-                "best_ask": str(ask),
-                "cap": str(cap),
-                "elapsed_ms": elapsed_ms,
-                "note": "yes_above_cap_strictly_abandon",
-            }
-    else:
-        # Non-YES legs (e.g. NO leg): use configured floor/cap
-        floor_raw = leg.get("floor")
-        floor = _dec(floor_raw) if floor_raw not in (None, "") else None
-        if floor is not None and ask <= floor:
-            return {
-                "status": "below_floor",
-                "leg": leg.get("leg"),
-                "token_id": token,
-                "best_ask": str(ask),
-                "floor": str(floor),
-                "cap": str(cap),
-                "elapsed_ms": elapsed_ms,
-                "note": "breakout_not_confirmed_skip_rung",
-            }
-
+    # Ladder: 0ms flat, 1500ms +1 tick, 4000ms still at +1 (cap-bounded)
+    floor_raw = leg.get("floor")
+    floor = _dec(floor_raw) if floor_raw not in (None, "") else None
+    if floor is not None and ask <= floor:
+        # Breakout not confirmed on this rung (ask still under the floor):
+        # skip, do not fill — later rungs retry; if price never enters the
+        # (floor, cap] window the leg simply ends unfilled.
+        return {
+            "status": "below_floor",
+            "leg": leg.get("leg"),
+            "token_id": token,
+            "best_ask": str(ask),
+            "floor": str(floor),
+            "cap": str(cap),
+            "elapsed_ms": elapsed_ms,
+            "note": "breakout_not_confirmed_skip_rung",
+        }
     extra = 0
     if elapsed_ms >= LADDER_MS[1]:
         extra = 1
     if elapsed_ms >= LADDER_MS[2]:
         extra = 1  # still only +1 tick; never open-ended chase
     limit = cap_price(ask, cap, tick, extra_ticks=extra)
-    if limit is None or (is_yes and limit > Decimal("0.90")):
+    if limit is None:
         return {
             "status": "abort_above_cap",
             "leg": leg.get("leg"),

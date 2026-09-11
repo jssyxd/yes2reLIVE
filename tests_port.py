@@ -138,8 +138,17 @@ def test_port_selection_matrix():
     port_mod.reset_cache()
     live = port_mod.get_port({"mode": "live"}, env=_live_env(), transport=object())
     assert isinstance(live, port_mod.LivePort) and live.mode == "live"
+    # and a transport without the probe stays usable (backward compatible)
+    port_mod.reset_cache()
+    assert port_mod.get_port({"mode": "live"}, env=_live_env(), transport=object()).mode == "live"
+    port_mod.reset_cache()
+    assert live.describe()["mode"] == "live"
+    port_mod.reset_cache()
+    assert isinstance(port_mod.get_port({"mode": "paper"}, env={}), port_mod.PaperPort)
 
-    # F3: a missing v2 SDK is reported as live_deps_missing (still fail-closed, never paper)
+
+def test_port_missing_v2_sdk_fails_closed():
+    """F3: a missing v2 SDK is reported as ``live_deps_missing`` — refuse, never fall back to paper."""
     class _NoSdk:
         RELEASE_WRITE_METHODS = ()
         V2_HINT = "py-clob-client-v2 is not importable …"
@@ -156,13 +165,6 @@ def test_port_selection_matrix():
         assert "not importable" in exc.detail, exc.detail
     else:
         raise AssertionError("a missing v2 SDK must be refused with live_deps_missing")
-    # and a transport without the probe stays usable (backward compatible)
-    port_mod.reset_cache()
-    assert port_mod.get_port({"mode": "live"}, env=_live_env(), transport=object()).mode == "live"
-    port_mod.reset_cache()
-    assert live.describe()["mode"] == "live"
-    port_mod.reset_cache()
-    assert isinstance(port_mod.get_port({"mode": "paper"}, env={}), port_mod.PaperPort)
 
 
 # --------------------------------------------------------------------------- paper regression
@@ -332,9 +334,13 @@ def test_live_port_preflight_uses_real_caps():
 
 
 def test_live_port_match_branches():
-    """Five offline branches: partial fill, full fill, no fill, cancel failure, no preflight."""
+    """Five offline branches: partial fill, full fill, no fill, cancel failure, no preflight.
+
+    A leg now only ever goes out as a FAK take (never passive): the leg carries its own cap and
+    its book shows a resting ask, so the branches below exercise the real fill reconciliation.
+    """
     book = {"best_ask": "0.60", "best_bid": "0.59", "tick_size": "0.01", "neg_risk": True}
-    leg = {"leg": "buy_no_broken", "token_id": "TOK_NO", "side": "BUY"}
+    leg = {"leg": "buy_no_broken", "token_id": "TOK_NO", "side": "BUY", "cap": "0.65"}
 
     partial = _StubTransport(results=[{"ok": True, "status": "matched", "filled_shares": Decimal("6"),
                                        "avg_price": Decimal("0.60"), "cost": Decimal("3.6"),
@@ -345,7 +351,9 @@ def test_live_port_match_branches():
     assert got["filled_shares"] == Decimal("6") and got["cost"] == Decimal("3.6"), got
     assert got["unfilled"] == Decimal("4") and got["source"] == "live", got
     kwargs = [call[1] for call in partial.calls if call[0] == "execute_leg"][0]
-    assert kwargs["post_only"] is True and kwargs["size"] == Decimal("10"), kwargs
+    assert kwargs["post_only"] is False and kwargs["clamp"] is False, kwargs
+    assert kwargs["taker"] is True and kwargs["cap"] == Decimal("0.65"), kwargs
+    assert kwargs["size"] == Decimal("10"), kwargs
 
     full = _StubTransport(results=[{"ok": True, "status": "matched", "filled_shares": Decimal("10"),
                                     "avg_price": Decimal("0.59"), "cost": Decimal("5.9"),
@@ -466,6 +474,7 @@ def _stub_v2_lib():
 
     class OrderType:
         GTC = "GTC"
+        FAK = "FAK"
 
     class ApiCreds:
         def __init__(self, *args):
@@ -916,6 +925,692 @@ def test_env_override_live_still_needs_port_gates():
     port_mod.reset_cache()
 
 
+# ------------------------- LIVE take rule: leg-level, independent, NEVER passive (Phase 3c2)
+
+#: the six boundary probes the operator-facing spec asks for (raw price string, is-taker)
+BAND_PROBES = [("0.479", False), ("0.480", False), ("0.4801", True),
+               ("0.8999", True), ("0.9000", True), ("0.9001", False)]
+
+#: the ladder only ever emits ``send_fak`` when a resting ask exists, so most fixtures have one
+TAKER_BOOK = {"best_ask": "0.62", "best_bid": "0.60", "tick_size": "0.01", "neg_risk": True}
+NO_BOOK = {"best_ask": None, "best_bid": None, "tick_size": "0.01", "neg_risk": True}
+
+
+def _yes_leg(px=None, *, cap="0.90"):
+    """The YES leg the way the ladder intent hands it to ``match`` (explicit cap required)."""
+    leg = {**FIRE["legs"][1], "cap": cap}
+    if px is not None:
+        leg["best_ask"] = str(px)
+    return leg
+
+
+def _no_leg(*, cap="0.65"):
+    """The NO leg — judged independently, on its own cap (the shipped ``no_max_ask`` is 1.0)."""
+    return {**FIRE["legs"][0], "cap": cap}
+
+
+def _yes_fire(px, *, source="ladder", key="london|2026-09-10|high"):
+    """A fire whose YES-leg price is reachable through one supported fire-level evidence source."""
+    fire = copy.deepcopy(FIRE)
+    fire["key"] = key
+    fire["new_yes_token"] = "TOK_YES"
+    if source == "ladder":
+        fire["ladder"] = [{"leg": "buy_no_broken", "outcome": "NO", "best_ask": "0.60"},
+                          {"leg": "buy_yes_new", "outcome": "YES", "best_ask": str(px)}]
+    elif source == "yes_ask":
+        fire["yes_ask"] = str(px)
+    return fire
+
+
+class _TakerStub(_StubTransport):
+    """Stub transport + the read-only YES re-quote the port uses when the fire carries no price."""
+
+    def __init__(self, *, results=None, yes_ask=None, book=None):
+        super().__init__(results=results)
+        self.yes_ask = yes_ask
+        self.yes_book = book
+
+    def refetch_book(self, client, token_id):
+        self.calls.append(("refetch_book", str(token_id)))
+        if self.yes_book is not None:
+            return self.yes_book
+        if self.yes_ask is None:
+            return None
+        return {"best_ask": str(self.yes_ask), "tick_size": "0.01"}
+
+
+def _decide(px="0.83", *, cfg=None, source="ladder", fire=None, leg=None, book=TAKER_BOOK,
+            cap="0.90", transport=None):
+    """One pure ``fill_mode`` decision (no order is ever placed by this helper)."""
+    port = _live_port(transport or _StubTransport(), account=ACCOUNT_OK, preflight=True)
+    fire = fire if fire is not None else _yes_fire(px, source=source)
+    target = leg if leg is not None else _yes_leg(px, cap=cap)
+    return port.fill_mode(fire=fire, leg=target, cfg=cfg if cfg is not None else CFG,
+                          book=book, client=object())
+
+
+def _run(leg, *, fire=None, cfg=None, book=TAKER_BOOK, limit="0.83", transport=None):
+    """One ``match`` call against a recording stub; returns (result, transport)."""
+    t = transport or _StubTransport()
+    port = _live_port(t, account=ACCOUNT_OK, preflight=True)
+    got = port.match(leg=leg, book=book, limit=Decimal(limit), shares=Decimal("10"),
+                     fire=fire, cfg=cfg if cfg is not None else CFG)
+    return got, t
+
+
+def _sent(t):
+    """Every ``execute_leg`` keyword bundle the port actually handed to the transport."""
+    return [call[1] for call in getattr(t, "calls", []) if call[0] == "execute_leg"]
+
+
+def _taker_client(*, status="matched", matched="6", size="10", price="0.83", token="TOK_YES",
+                  trades=None):
+    """A scripted v2 client whose order ends in the requested state."""
+    if trades is None:
+        trades = ([{"orderID": "ORD-1", "size": matched, "price": price}]
+                  if Decimal(matched) > 0 else [])
+    return _StubV2Client(order_states=[{"status": status, "size_matched": matched,
+                                        "original_size": size, "price": price,
+                                        "asset_id": token}], trades=trades)
+
+
+def test_live_taker_yes_band_matrix():
+    """``(0.48, 0.90]`` half-open on the YES leg's own price — helper *and* end to end."""
+    lo, hi = port_mod.DEFAULT_YES_MIN_ASK, port_mod.DEFAULT_YES_MAX_ASK
+    assert (lo, hi) == (Decimal("0.48"), Decimal("0.90"))
+    assert port_mod.GATE_YES_BAND == "yes_band" and port_mod.TAKER == "taker"
+    assert port_mod.SKIP == "skip" and port_mod.MAKER == "maker"
+    for raw, want in BAND_PROBES:
+        # (1) the pure half-open predicate, for every numeric shape the leg may carry
+        for probe in (raw, Decimal(raw), float(raw)):
+            assert port_mod.in_yes_band(probe, lo, hi) is want, (probe, want)
+        # (2) end to end on the YES leg: in band ⇒ one FAK; out of band ⇒ NOTHING goes out
+        got, t = _run(_yes_leg(raw))
+        assert got["order_mode"] == ("taker" if want else "skip"), (raw, got)
+        assert got["yes_price"] == Decimal(raw), (raw, got)
+        calls = _sent(t)
+        if want:
+            assert len(calls) == 1, (raw, calls)
+            assert calls[0]["taker"] is True and calls[0]["post_only"] is False, calls
+            assert calls[0]["clamp"] is False, calls
+        else:
+            assert calls == [], (raw, t.calls)
+            assert got["filled_shares"] == ZERO and got["unfilled"] == Decimal("10"), (raw, got)
+    # the two endpoints, explicitly: 0.48 itself is excluded, 0.90 itself is included
+    assert port_mod.in_yes_band("0.480000", lo, hi) is False
+    assert port_mod.in_yes_band("0.900000", lo, hi) is True
+    # (3) the operator's stub-count matrix, on the exact prices of the instruction: the leg-level
+    #     call count alone must show it — 0 orders out of band, exactly 1 in band, and a
+    #     ``post_only=True`` submission may never appear anywhere.  (``taker=True`` ⇒ FAK is then
+    #     proven at the transport level by ``test_live_taker_order_construction``: post_order gets
+    #     ``OrderType.FAK`` with ``post_only=False``.)
+    for raw in ("0.40", "0.479", "0.48", "0.9001", "0.99"):
+        got, t = _run(_yes_leg(raw))
+        assert got["order_mode"] == "skip" and _sent(t) == [], (raw, got, t.calls)
+        assert not [c for c in _sent(t) if c.get("post_only") is True], (raw, t.calls)
+    for raw in ("0.4801", "0.60", "0.8999", "0.90"):
+        got, t = _run(_yes_leg(raw))
+        calls = _sent(t)
+        assert got["order_mode"] == "taker" and len(calls) == 1, (raw, got, t.calls)
+        assert calls[0]["taker"] is True and calls[0]["post_only"] is False, (raw, calls)
+        assert calls[0]["clamp"] is False, (raw, calls)
+    # garbage / out-of-range prices can never take
+    for bad in (None, "", "abc", "0", "-0.5", "1.5", "NaN", "inf"):
+        assert port_mod.in_yes_band(bad, lo, hi) is False, bad
+
+
+def test_live_leg_scope_is_independent():
+    """The legs are judged independently — a YES band never decides the NO leg's fate.
+
+    YES leg: inside the band ⇒ FAK; **outside the band ⇒ no order at all** (never a resting
+    ``post_only`` order — that is the whole point of the corrected rule).
+    NO leg: takes whenever its own book shows an ask, regardless of the YES band, and is
+    ``no_book``-skipped otherwise.
+    """
+    # (a) YES leg in band ⇒ exactly one FAK take
+    in_band, t_in = _run(_yes_leg("0.83"))
+    assert in_band["order_mode"] == "taker" and len(_sent(t_in)) == 1, in_band
+    assert _sent(t_in)[0]["audit_extra"]["taker_gate"] == "yes_band", _sent(t_in)[0]
+    # (b) the operator's fake-breakout cases (and the other side of the band): zero orders
+    for px in ("0.40", "0.39", "0.42", "0.48", "0.4799", "0.95", "0.99", "1.0"):
+        got, t = _run(_yes_leg(px))
+        expect = "yes_price_below_band" if Decimal(px) <= Decimal("0.48") else "yes_price_above_band"
+        assert got["status"] == expect, (px, got)
+        assert got["order_mode"] == "skip" and _sent(t) == [], (px, t.calls)
+        assert got["filled_shares"] == ZERO and got["fill_and_kill"] is False, (px, got)
+    # (c) the NO leg ignores the band in both directions: with an ask it takes on its own cap
+    for yes_px in ("0.40", "0.83", "0.99"):
+        got, t = _run(_no_leg(), fire=_yes_fire(yes_px))
+        call = _sent(t)
+        assert got["order_mode"] == "taker" and len(call) == 1, (yes_px, got)
+        assert call[0]["taker"] is True and call[0]["post_only"] is False, call
+        assert call[0]["cap"] == Decimal("0.65"), call
+        assert call[0]["audit_extra"]["taker_gate"] == "no_leg_ask", call
+        assert got["yes_price"] is None, (yes_px, got)
+    # (d) ... and with no resting ask the NO leg is a no_book skip — still nothing passive
+    got, t = _run(_no_leg(), book=NO_BOOK)
+    assert got["status"] == "no_book" and got["order_mode"] == "skip", got
+    assert _sent(t) == [], t.calls
+    # (e) the shipped NO cap (``no_max_ask = 1.0``) is still a take: only the absolute
+    #     ``<= 1`` limit binds (documented inconsistency with AGENTS.md's 0.65 — kept as-is)
+    got, t = _run(_no_leg(cap="1.0"), limit="0.99")
+    assert got["order_mode"] == "taker" and _sent(t)[0]["cap"] == Decimal("1.0"), got
+
+
+def test_live_no_passive_fallback_anywhere():
+    """Every non-take cause drops the leg: no order, no ``post_only``, status names the cause."""
+    cases = [
+        ("taker_cap_missing", _yes_leg("0.83", cap=None)),
+        ("taker_cap_missing", {k: v for k, v in _yes_leg("0.83").items() if k != "cap"}),
+        ("taker_cap_missing", _yes_leg("0.83", cap="1.5")),
+        ("taker_cap_missing", _no_leg(cap="0")),
+        ("yes_price_unknown", _yes_leg(None)),
+    ]
+    for want_status, leg in cases:
+        got, t = _run(leg, fire=copy.deepcopy(FIRE))
+        assert got["status"] == want_status, (want_status, got)
+        assert got["order_mode"] == "skip" and got["filled_shares"] == ZERO, (want_status, got)
+        assert got["unfilled"] == Decimal("10"), (want_status, got)
+        assert _sent(t) == [], (want_status, t.calls)
+    # the YES leg with no resting ask is a no_book skip, not a resting order
+    got, t = _run(_yes_leg("0.83"), book=NO_BOOK)
+    assert got["status"] == "no_book" and _sent(t) == [], got
+    # an illegal band refuses every leg (a corrupt config stands the whole fire down)
+    for bad in ({"yes_max_ask": "abc"}, {"yes_min_ask": "0"},
+                {"yes_min_ask": "0.95", "yes_max_ask": "0.90"},
+                {"strategy": {"yes_min_ask": "NaN", "yes_max_ask": "0.9"}},
+                {"strategy": {"yes_min_ask": "0.48", "yes_max_ask": "1.5"}}):
+        for leg in (_yes_leg("0.83"), _no_leg()):
+            d = _decide("0.83", cfg=bad, leg=leg)
+            assert d["taker"] is False and d["reason"] == "yes_band_unparsed", (bad, leg["leg"], d)
+        got, t = _run(_yes_leg("0.83"), cfg=bad)
+        assert got["status"] == "yes_band_unparsed" and _sent(t) == [], (bad, got)
+    # the port advertises the rule it implements: no passive mode exists on the trading path
+    port = _live_port(_StubTransport(), account=ACCOUNT_OK, preflight=True)
+    described = port.describe()
+    assert described["passive_fallback"] is False, described
+    assert described["taker_scope"] == "leg_level_independent", described
+    assert "maker" not in described["order_modes"], described
+    assert described["taker_gates"] == ["yes_band", "no_leg_ask"], described
+
+
+def test_live_taker_cap_required_and_bounded():
+    """L-2: any take needs an explicit ``0 < cap <= 1``; missing/junk/``> 1`` refuses at BOTH layers."""
+    # (a) port layer: an unusable cap ⇒ skip, never an uncapped aggressor
+    for cap in (None, "", "abc", "0", "-0.5", "NaN", "inf", "1.5", "2", True):
+        leg = {k: v for k, v in _yes_leg("0.83").items() if k != "cap"}
+        if cap is not None:
+            leg["cap"] = cap
+        d = _decide("0.83", leg=leg)
+        assert d["taker"] is False and d["reason"] == "taker_cap_missing", (cap, d)
+        assert d["order_mode"] == "skip" and d["cap"] is None, (cap, d)
+    # ... while cap == 1.0 (the shipped ``no_max_ask``) and any sane cap still take in band
+    for cap in ("1.0", "0.90", "0.65", "0.4801", "0.0001"):
+        d = _decide("0.83", leg=_yes_leg("0.83", cap=cap))
+        assert d["taker"] is True and d["cap"] == Decimal(cap), (cap, d)
+    # (b) transport layer (last line of defence, independent of the caller)
+    for bad_cap in (None, "", "abc", "0", "-0.5", "1.5", "2"):
+        client = _StubV2Client()
+        with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+            log = Path(tmp) / "a.jsonl"
+            out = v2_transport.execute_leg(client, token_id="TOK_YES", side="BUY", price="0.83",
+                                           size="10", book=TAKER_BOOK, gates=GATES_OK, taker=True,
+                                           cap=bad_cap, audit_path=log, sleep=lambda _s: None)
+            lines = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert out["ok"] is False and out["status"] == "taker_cap_required", (bad_cap, out)
+        assert client.calls == [], (bad_cap, client.calls)
+        assert [line["reason"] for line in lines] == ["taker_cap_required"], (bad_cap, lines)
+    # (c) cap == 1.0 is accepted; the absolute ``<= 1`` limit is what binds
+    client = _taker_client(matched="10", price="0.99")
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        out = v2_transport.execute_leg(client, token_id="TOK_NO", side="BUY", price="0.99",
+                                       size="10", book=TAKER_BOOK, gates=GATES_OK, taker=True,
+                                       cap="1.0", audit_path=Path(tmp) / "a.jsonl",
+                                       sleep=lambda _s: None, poll_attempts=2)
+    assert out["ok"] is True and out["limit_price"] == "0.99", out
+    assert out["order_mode"] == "taker" and out["order_type"] == "FAK", out
+    assert [c[3] for c in client.calls if c[0] == "post_order"] == [False], client.calls
+
+
+def test_live_ask_quote_out_of_range_is_not_no_book():
+    """Audit LOW (2026-09-12): a quote that is *present but unusable* is ``ask_out_of_range``.
+
+    An ask of ``> 1`` / ``<= 0`` / non-numeric used to fall through the same ``None`` as a genuinely
+    empty book and was reported as ``no_book`` — which points the operator at a missing feed when
+    the real problem is a corrupt one.  The two cases are now distinct reasons (both still send
+    **no order at all**), while ``best_ask_of`` keeps its historical ``Decimal | None`` contract.
+    """
+    assert port_mod.FILL_REFUSE_ASK_BAD == "ask_out_of_range"
+    # (a) the pure classifier: empty book vs. unusable quote
+    for empty in ({}, {"best_ask": None}, {"best_ask": ""}, {"best_ask": "   "}, None):
+        state = port_mod.ask_state_of(empty)
+        assert state["present"] is False and state["ask"] is None, (empty, state)
+    for bad in ("0", "-0.5", "1.5", "1.0001", "2", "abc", "NaN", "inf", True, {}):
+        state = port_mod.ask_state_of({"best_ask": bad})
+        assert state["present"] is True and state["ask"] is None, (bad, state)
+        assert state["raw"] == bad, (bad, state)
+    good = port_mod.ask_state_of({"best_ask": "0.83"})
+    assert good == {"present": True, "ask": Decimal("0.83"), "raw": "0.83"}, good
+    # (b) ``best_ask_of`` is unchanged (the contract callers/tests already rely on)
+    assert port_mod.best_ask_of({"best_ask": "0.61"}) == Decimal("0.61")
+    assert port_mod.best_ask_of({"best_ask": "1.5"}) is None
+    assert port_mod.best_ask_of({"best_ask": None}) is None and port_mod.best_ask_of(None) is None
+    # (c) end to end: the bad quote is named, nothing is sent, and it is *not* mislabelled no_book
+    bad_book = {"best_ask": "1.5", "best_bid": "0.01", "tick_size": "0.01", "neg_risk": True}
+    for leg in (_no_leg(), _yes_leg("0.83")):
+        got, t = _run(leg, book=bad_book)
+        assert got["status"] == "ask_out_of_range", (leg["leg"], got)
+        assert got["order_mode"] == "skip" and got["filled_shares"] == ZERO, (leg["leg"], got)
+        assert got["unfilled"] == Decimal("10") and got["fill_and_kill"] is False, (leg["leg"], got)
+        assert _sent(t) == [], t.calls
+    # (d) a genuinely empty book is still ``no_book`` — the two reasons never collapse again
+    got, t = _run(_no_leg(), book=NO_BOOK)
+    assert got["status"] == "no_book" and _sent(t) == [], got
+
+
+def test_live_taker_price_bounds():
+    """L-3: the taker path refuses a limit ``<= 0``, ``> cap`` or ``> 1`` — it never re-prices."""
+    def _send(**kw):
+        client = _taker_client()
+        with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+            log = Path(tmp) / "a.jsonl"
+            log.write_text("", encoding="utf-8")     # a refusal may legitimately write nothing
+            out = v2_transport.execute_leg(client, token_id="TOK_YES", side="BUY", size="10",
+                                           book=TAKER_BOOK, gates=GATES_OK, taker=True,
+                                           audit_path=log, sleep=lambda _s: None, poll_attempts=2,
+                                           **kw)
+            lines = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return out, client, lines
+
+    out, client, lines = _send(price="1.5", cap="0.9")
+    assert out["status"] == "price_out_of_range" and client.calls == [], out
+    assert [line["reason"] for line in lines] == ["price_out_of_range"], lines
+    out, client, _ = _send(price="0", cap="0.9")
+    assert out["status"] == "invalid_input" and client.calls == [], out
+    out, client, _ = _send(price="-0.5", cap="0.9")
+    assert out["status"] == "invalid_input" and client.calls == [], out
+    out, client, lines = _send(price="0.95", cap="0.9")
+    assert out["status"] == "above_cap" and client.calls == [], out
+    assert [line["reason"] for line in lines] == ["above_cap"], lines
+    out, client, lines = _send(price="0.835", cap="0.9")
+    assert out["status"] == "price_not_on_tick" and client.calls == [], out
+    assert [line["reason"] for line in lines] == ["price_not_on_tick"], lines
+    # the boundary values themselves are legal and go out unclamped
+    for price in ("0.90", "1.0"):
+        out, client, _ = _send(price=price, cap="1.0")
+        assert out["ok"] is True and out["limit_price"] == price, (price, out)
+        assert out["clamped"] is False and out["order_mode"] == "taker", out
+        assert [c for c in client.calls if c[0] == "post_order"], client.calls
+
+
+def test_live_taker_evidence_chain():
+    """The YES leg's own evidence: leg ask → fire ladder → fire field → one read-only re-quote."""
+    # (a) the ladder intent being matched is the everyday live case
+    got = _decide("0.83")
+    assert got["taker"] is True and got["source"] == "leg_best_ask", got
+    # (b) the fire's own ladder row
+    got = _decide(None, fire=_yes_fire("0.83"), leg=_yes_leg())
+    assert got["taker"] is True and got["source"] == "fire_ladder", got
+    # (c) an explicit fire field
+    got = _decide(None, fire=_yes_fire("0.83", source="yes_ask"), leg=_yes_leg())
+    assert got["taker"] is True and got["source"] == "fire_yes_ask", got
+    # (d) ONE read-only re-quote per fire serves every later rung (memoised), never a write
+    stub = _TakerStub(yes_ask="0.83")
+    port = _live_port(stub, account=ACCOUNT_OK, preflight=True)
+    fire = copy.deepcopy(FIRE)                     # no ladder, no field: the real fire shape
+    leg = _yes_leg()                               # ... and no leg price either
+    first = port.fill_mode(fire=fire, leg=leg, cfg=CFG, book=TAKER_BOOK, client=object())
+    second = port.fill_mode(fire=fire, leg=leg, cfg=CFG, book=TAKER_BOOK, client=object())
+    assert first["taker"] is True and first["source"] == "refetch_book_yes_leg", first
+    assert second["taker"] is True and second["source"].endswith("_memo"), second
+    assert [c for c in stub.calls if c[0] == "refetch_book"] == [("refetch_book", "TOK_YES")], stub.calls
+    # ``build_client`` belongs to preflight; the point here is that no ORDER was ever placed
+    assert not [c for c in stub.calls if c[0] == "execute_leg"], stub.calls
+    nxt = port.fill_mode(fire=_yes_fire("0.95", key="other|2026-09-10|high"), leg=_yes_leg(),
+                         cfg=CFG, book=TAKER_BOOK, client=object())
+    assert nxt["taker"] is False and nxt["reason"] == "yes_price_above_band", nxt
+    assert len([c for c in stub.calls if c[0] == "refetch_book"]) == 1, stub.calls
+    # (e) a failed / empty re-quote only drops the leg (fail-closed, no crash)
+    broken = _TakerStub(yes_ask=None)
+    port = _live_port(broken, account=ACCOUNT_OK, preflight=True)
+    failed = port.fill_mode(fire=copy.deepcopy(FIRE), leg=_yes_leg(), cfg=CFG,
+                            book=TAKER_BOOK, client=object())
+    assert failed["taker"] is False and failed["reason"] == "yes_price_unknown", failed
+    # (f) a transport without the read-only hook is equally fail-closed
+    port = _live_port(_StubTransport(), account=ACCOUNT_OK, preflight=True)
+    nohook = port.fill_mode(fire=copy.deepcopy(FIRE), leg=_yes_leg(), cfg=CFG,
+                            book=TAKER_BOOK, client=object())
+    assert nohook["taker"] is False and nohook["reason"] == "yes_price_unknown", nohook
+
+
+def test_live_taker_order_construction():
+    """Taker: post_only=False, OrderType.FAK, price NOT pressed down, cap still binding."""
+    client = _taker_client(matched="6", price="0.83")
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        result = v2_transport.execute_leg(
+            client, token_id="TOK_YES", side="BUY", price="0.83", size="10",
+            book={"best_ask": "0.83", "tick_size": "0.01", "neg_risk": True},
+            gates=GATES_OK, taker=True, cap="0.90", sleep=lambda _s: None, poll_attempts=2,
+            audit_path=log, audit_extra={"taker_gate": "yes_band", "yes_price": "0.83"})
+        lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert result["ok"] is True and result["order_mode"] == "taker", result
+    assert result["order_type"] == "FAK" and result["fill_and_kill"] is True, result
+    assert result["limit_price"] == "0.83" and result["clamped"] is False, result
+    assert result["filled_shares"] == Decimal("6") and result["cost"] == Decimal("4.98"), result
+    assert result["avg_price"] == Decimal("0.83") and result["unfilled"] == Decimal("4"), result
+    assert result["voided_shares"] == Decimal("4"), result
+    posts = [call for call in client.calls if call[0] == "post_order"]
+    assert len(posts) == 1, client.calls
+    assert posts[0][2] == "FAK" and posts[0][3] is False, posts[0]
+    assert client.calls[0][0] == "create_order", client.calls
+    args = client.calls[0][1]
+    assert Decimal(str(args.price)) == Decimal("0.83") and str(args.size) == "10.0", vars(args)
+    # FAK is terminal: the remainder is voided, no cancel (and no false residual risk)
+    assert not [call for call in client.calls if call[0] == "cancel_orders"], client.calls
+    assert result["residual_risk"] is False, result
+    intent = lines[0]
+    assert intent["action"] == "intent" and intent["params"]["order_mode"] == "taker", intent
+    assert intent["params"]["order_type"] == "FAK" and intent["params"]["post_only"] is False, intent
+    assert intent["params"]["taker_gate"] == "yes_band", intent
+    assert intent["params"]["yes_price"] == "0.83", intent
+
+    # a misaligned price is refused rather than silently moved (tick alignment is a red line)
+    misaligned = _StubV2Client()
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        off = v2_transport.execute_leg(misaligned, token_id="TOK_YES", side="BUY", price="0.835",
+                                       size="10",
+                                       book={"best_ask": "0.83", "tick_size": "0.01"},
+                                       gates=GATES_OK, taker=True, cap="0.90", audit_path=log,
+                                       sleep=lambda _s: None)
+    assert off["ok"] is False and off["status"] == "price_not_on_tick", off
+    assert misaligned.calls == [], misaligned.calls
+
+    # an SDK build without FAK must refuse — never fall back to a resting GTC
+    no_fak = _StubV2Client()
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        import py_clob_client_v2.clob_types as _types          # the stubbed module
+        saved = _types.OrderType
+        try:
+            class _NoFak:
+                GTC = "GTC"
+
+            _types.OrderType = _NoFak
+            log = Path(tmp) / "audit.jsonl"
+            refused = v2_transport.execute_leg(no_fak, token_id="TOK_YES", side="BUY", price="0.83",
+                                               size="10", book=TAKER_BOOK, gates=GATES_OK, taker=True,
+                                               cap="0.90", audit_path=log, sleep=lambda _s: None)
+            lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+        finally:
+            _types.OrderType = saved
+    assert refused["ok"] is False and refused["status"] == "no_fak_order_type", refused
+    assert no_fak.calls == [], no_fak.calls
+    assert [line["reason"] for line in lines] == ["no_fak_order_type"], lines
+
+
+def test_live_taker_fill_accounting():
+    """Partial and zero-fill FAK replies book exactly what the venue reported."""
+    partial = _taker_client(matched="6", price="0.83",
+                            trades=[{"orderID": "ORD-1", "size": "4", "price": "0.83"},
+                                    {"orderID": "ORD-1", "size": "2", "price": "0.83"}])
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        part = v2_transport.execute_leg(partial, token_id="TOK_YES", side="BUY", price="0.83",
+                                        size="10", book=TAKER_BOOK, gates=GATES_OK, taker=True,
+                                        cap="0.90", audit_path=Path(tmp) / "a.jsonl",
+                                        sleep=lambda _s: None, poll_attempts=2)
+    assert part["filled_shares"] == Decimal("6") and part["unfilled"] == Decimal("4"), part
+    assert part["voided_shares"] == Decimal("4") and part["cost"] == Decimal("4.98"), part
+    assert part["residual_risk"] is False and not [c for c in partial.calls if c[0] == "cancel_orders"]
+
+    killed = _taker_client(status="cancelled", matched="0", price="0.83")
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        none_filled = v2_transport.execute_leg(killed, token_id="TOK_YES", side="BUY", price="0.83",
+                                               size="10", book=TAKER_BOOK, gates=GATES_OK, taker=True,
+                                               cap="0.90", audit_path=Path(tmp) / "a.jsonl",
+                                               sleep=lambda _s: None, poll_attempts=2)
+    assert none_filled["ok"] is True and none_filled["status"] == "cancelled", none_filled
+    assert none_filled["filled_shares"] == ZERO and none_filled["cost"] == ZERO, none_filled
+    # nb: ``poll_fill`` reports the order's own price as ``avg_price`` when there is no trade at
+    # all (pre-existing behaviour, untouched); with zero filled shares the cost stays 0
+    assert none_filled["avg_price"] == Decimal("0.83"), none_filled
+    assert none_filled["unfilled"] == Decimal("10"), none_filled
+    assert none_filled["voided_shares"] == Decimal("10"), none_filled
+    assert none_filled["residual_risk"] is False, none_filled
+    assert not [c for c in killed.calls if c[0] == "cancel_orders"], killed.calls
+
+    # ... and the port reports the same numbers to the engine ladder (remaining stays 10 ⇒ that
+    # leg books no position, exactly like paper's no-fill)
+    transport = _TakerStub(results=[dict(none_filled)])
+    port = _live_port(transport, account=ACCOUNT_OK, preflight=True)
+    via_port = port.match(leg=_yes_leg("0.83"), book=TAKER_BOOK, limit=Decimal("0.83"),
+                          shares=Decimal("10"), fire=_yes_fire("0.83"), cfg=CFG)
+    assert via_port["filled_shares"] == ZERO and via_port["unfilled"] == Decimal("10"), via_port
+    assert via_port["cost"] == ZERO and via_port["order_mode"] == "taker", via_port
+
+
+def test_live_taker_gates_not_bypassable():
+    """A band-eligible take is impossible without the gates *and* without a live preflight."""
+    client = _StubV2Client()
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        for bad in (None, {}, {"ok": True}, {"ok": True, "checks": {"cli_flag": True}},
+                    {"ok": True, "checks": {"cli_flag": True, "env_flag": True,
+                                            "confirm_phrase": False}}):
+            try:
+                v2_transport.execute_leg(client, token_id="TOK_YES", side="BUY", price="0.83",
+                                         size="10", book=TAKER_BOOK, gates=bad, taker=True,
+                                         cap="0.90", audit_path=log, sleep=lambda _s: None)
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError(f"taker with gates={bad!r} must be refused")
+        assert client.calls == [], f"nothing signed or sent: {client.calls}"
+        lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert [line["reason"] for line in lines] == ["gates_missing"] * 5, lines
+
+    # no preflight ⇒ no order, even with the YES leg inside the band
+    port = _live_port(_StubTransport(), account=ACCOUNT_OK)
+    blocked = port.match(leg=_yes_leg("0.83"), book=TAKER_BOOK, limit=Decimal("0.83"),
+                         shares=Decimal("10"), fire=_yes_fire("0.83"), cfg=CFG)
+    assert blocked["status"] == "live_not_preflighted" and blocked["filled_shares"] == ZERO, blocked
+
+    # a *denied* preflight leaves no client behind, so a later match cannot slip through
+    transport = _StubTransport()
+    port = _live_port(transport, account={"usdc_balance": 1.0, "open_orders": 0, "positions": [],
+                                          "positions_value_usdc": 0.0})
+    pre = port.preflight(fire={**FIRE, "budget_usdc": "12"}, cfg={"fire_budget_usdc": 12})
+    assert pre["ok"] is False and pre["reason"] == "risk_gate:budget_exceeds_balance", pre
+    after = port.match(leg=_yes_leg("0.83"), book=TAKER_BOOK, limit=Decimal("0.83"),
+                       shares=Decimal("10"), fire=_yes_fire("0.83"), cfg=CFG)
+    assert after["status"] == "live_not_preflighted", after
+    assert not [call for call in transport.calls if call[0] == "execute_leg"], transport.calls
+
+
+def test_live_taker_limits_and_band_fail_closed():
+    """check_limits/risk_gate still gate the fire; an unusable band refuses instead of resting."""
+    # (a) the cumulative / per-fire caps are the pre-existing ones — the band cannot widen them
+    transport = _StubTransport()
+    port = _live_port(transport, account={"usdc_balance": 51.0, "open_orders": 0, "positions": [],
+                                          "positions_value_usdc": 0.0},
+                      limits={"fire_budget_usdc": "12", "max_open_positions": "10",
+                              "max_capital_usdc": "50"})
+    over_budget = port.preflight(fire={**FIRE, "budget_usdc": "13"}, cfg={"fire_budget_usdc": 13})
+    assert over_budget["ok"] is False and over_budget["reason"] == "limits:notional_exceeds_fire_budget", over_budget
+    crowded = port.preflight(fire={**FIRE, "budget_usdc": "12"},
+                             cfg={"fire_budget_usdc": 12})
+    assert crowded["ok"] is True, crowded
+    assert submit.check_limits(notional_usdc="12", fire_budget_usdc="12", committed_usdc="45",
+                               max_capital_usdc="50")["reason"] == submit.LIMIT_CAPITAL_CAP
+    # the guard is the shared function — untouched by the take rule
+    assert v2_transport.submit.check_limits is submit.check_limits
+
+    # (b) the band comes from cfg (flat or strategy) and defaults to 0.48/0.90
+    default_band = port_mod.yes_price_band({})
+    assert default_band["ok"] and (default_band["lo"], default_band["hi"]) == (Decimal("0.48"), Decimal("0.90"))
+    nested = port_mod.yes_price_band({"strategy": {"yes_min_ask": "0.50", "yes_max_ask": "0.99"}})
+    assert (nested["lo"], nested["hi"]) == (Decimal("0.50"), Decimal("0.99"))
+    flat_wins = port_mod.yes_price_band({"yes_min_ask": "0.10", "yes_max_ask": "0.20",
+                                         "strategy": {"yes_min_ask": "0.50", "yes_max_ask": "0.99"}})
+    assert (flat_wins["lo"], flat_wins["hi"]) == (Decimal("0.10"), Decimal("0.20"))
+    # a real config carries the band under cfg["strategy"] — read it and take inside it
+    real = json.loads((ROOT / "config" / "yes2re_reversal.json").read_text(encoding="utf-8"))
+    real_band = port_mod.yes_price_band(real)
+    assert real_band == {"ok": True, "lo": Decimal("0.48"), "hi": Decimal("0.9"),
+                        "detail": "(0.48, 0.9]"}, real_band
+    # ... and the band it yields is what actually decides: 0.60 in, 0.30/0.95 out
+    shifted = {"strategy": {"yes_min_ask": "0.30", "yes_max_ask": "0.60"}}
+    assert _decide("0.60", cfg=shifted)["taker"] is True
+    assert _decide("0.30", cfg=shifted)["reason"] == "yes_price_below_band"
+    assert _decide("0.65", cfg=shifted)["reason"] == "yes_price_above_band"
+
+    # (c) a present-but-illegal band refuses the leg (never a downgrade to a resting order)
+    for bad in ({"yes_max_ask": "abc"}, {"yes_min_ask": "0"}, {"yes_min_ask": "0.95", "yes_max_ask": "0.90"},
+                {"strategy": {"yes_min_ask": "NaN", "yes_max_ask": "0.9"}},
+                {"strategy": {"yes_min_ask": "-0.1", "yes_max_ask": "0.9"}},
+                {"strategy": {"yes_max_ask": "1.5", "yes_min_ask": "0.48"}}):
+        got = _decide("0.83", cfg=bad)
+        assert got["taker"] is False and got["reason"] == "yes_band_unparsed", (bad, got)
+        assert got["order_mode"] == "skip" and got["yes_price"] is None, (bad, got)
+
+
+def test_live_taker_decision_alone_is_not_audited():
+    """L-1: a pure decision writes NO audit row; a real take still lands on intent/submit."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        log.write_text("", encoding="utf-8")
+        saved = submit.AUDIT_PATH
+        submit.AUDIT_PATH = log
+        try:
+            transport = _TakerStub(yes_ask="0.83")
+            port = _live_port(transport, account=ACCOUNT_OK, preflight=True)
+            port.audit_path = log
+            # every shape of pure decision — in band, below, above, NO leg, uncapped YES leg,
+            # YES leg with an empty book — must leave the log exactly as it was
+            for px in ("0.83", "0.30", "0.95"):
+                port.fill_mode(fire=_yes_fire(px), leg=_yes_leg(px), cfg=CFG,
+                               book=TAKER_BOOK, client=object())
+                port.match(leg=_yes_leg(px), book=TAKER_BOOK, limit=Decimal("0.83"),
+                           shares=Decimal("10"), fire=_yes_fire(px), cfg=CFG)
+            port.match(leg=_no_leg(), book=NO_BOOK, limit=Decimal("0.62"), shares=Decimal("10"),
+                       fire=_yes_fire("0.83"), cfg=CFG)
+            port.match(leg=_yes_leg("0.83", cap=None), book=TAKER_BOOK, limit=Decimal("0.83"),
+                       shares=Decimal("10"), fire=_yes_fire("0.83"), cfg=CFG)
+            port.match(leg=_yes_leg("0.83"), book=NO_BOOK, limit=Decimal("0.83"),
+                       shares=Decimal("10"), fire=_yes_fire("0.83"), cfg=CFG)
+            assert log.read_text(encoding="utf-8").strip() == "", log.read_text(encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = submit._audit_summary(as_json=True)
+            summary = json.loads(out.getvalue())
+            assert rc == 0 and summary["records"] == 0, summary
+            assert summary["actions"] == {} and summary["real_submits"] == 0, summary
+            assert "fill_mode" not in summary["actions"], summary
+
+            # a REAL take (stub SDK) still records intent + submit, carrying the decision fields
+            client = _taker_client(matched="10", price="0.83")
+            with _stub_v2_lib():
+                taken = v2_transport.execute_leg(
+                    client, token_id="TOK_YES", side="BUY", price="0.83", size="10",
+                    book=TAKER_BOOK, gates=GATES_OK, taker=True, cap="0.90",
+                    sleep=lambda _s: None, poll_attempts=2, audit_path=log,
+                    audit_extra={"taker_gate": "yes_band", "taker_gate_ok": True,
+                                 "yes_price": "0.83", "yes_price_source": "leg_best_ask",
+                                 "fill_mode": "yes_band", "leg": "buy_yes_new"})
+            assert taken["ok"] is True, taken
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                submit._audit_summary(as_json=True)
+            summary = json.loads(out.getvalue())
+        finally:
+            submit.AUDIT_PATH = saved
+    assert summary["records"] == 2 and summary["actions"] == {"intent": 1, "submit": 1}, summary
+    assert "fill_mode" not in summary["actions"], summary
+    assert summary["real_submits"] == 1 and summary["submit_order_ids"] == ["ORD-1"], summary
+
+
+def test_live_fire_intent_is_leg_level():
+    """End to end through the engine: each leg is judged on its own evidence, nothing is passive.
+
+    ``_r_cycle._paper_fire`` is unchanged (the paper path is byte-identical); this proves the
+    *live* side of that same call: the YES leg's own ladder rung and the port band agree exactly
+    (``send_fak`` ⇔ ask ∈ (0.48, 0.90]), the NO leg takes on its own ask independently, and a leg
+    that is not eligible produces **no order at all**.
+    """
+    yes_book = {"best_ask": "0.83", "tick_size": "0.01", "neg_risk": True,
+                "asks": [{"price": "0.83", "size": "50"}], "bids": [{"price": "0.80", "size": "100"}]}
+    books = {**BOOKS, "TOK_YES": yes_book}
+
+    def _fire_run(yes_ask, *, books_by_token=None):
+        fire = copy.deepcopy(FIRE)
+        fire["legs"][1]["cap"] = "0.90"            # the shipped YES cap (yes_max_ask)
+        fire["yes_ask"] = str(yes_ask)
+        transport = _TakerStub()
+        port = port_mod.LivePort(transport, env=_live_env(), gates=GATES_OK,
+                                 limits={"fire_budget_usdc": "20", "max_open_positions": "12",
+                                         "max_capital_usdc": "500"},
+                                 account_reader=lambda client: ACCOUNT_OK, sleep=lambda _s: None)
+        port_mod.reset_cache()
+        port_mod._CACHE[port_mod.LIVE] = port
+        with contextlib.redirect_stderr(io.StringIO()):
+            cfg = _r_state.load_config(str(ROOT / "config" / "yes2re_reversal.json"),
+                                       env={"YES2RE_MODE": "live"})
+        state: dict = {"paper_initial_capital_usdc": 600.0}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_patched(_r_cycle,
+                                         book_cache=lambda: copy.deepcopy(books_by_token or books),
+                                         log_event=lambda path, payload: None))
+            stack.enter_context(_patched(port_mod.creds_mod, load_env_file=lambda: _live_env()))
+            position, ladlog = _r_cycle._paper_fire(cfg, state, fire, NOW)
+        port_mod.reset_cache()
+        calls = [call[1] for call in transport.calls if call[0] == "execute_leg"]
+        return cfg, position, ladlog, calls
+
+    cfg, position, ladlog, calls = _fire_run("0.83")
+    assert cfg["mode"] == "live" and cfg["strategy"]["yes_min_ask"] == "0.48", cfg["strategy"]
+    assert position is not None and position["key"] == FIRE["key"], position
+    by_token = {kw["token_id"]: kw for kw in calls}
+    assert set(by_token) == {"TOK_NO", "TOK_YES"}, calls
+    yes_kw, no_kw = by_token["TOK_YES"], by_token["TOK_NO"]
+    # the YES leg (its own ask 0.83, inside the band): one FAK take, never clamped, cap forwarded
+    assert yes_kw["taker"] is True and yes_kw["post_only"] is False and yes_kw["clamp"] is False, yes_kw
+    assert yes_kw["cap"] == Decimal("0.90"), yes_kw
+    assert yes_kw["audit_extra"]["taker_gate"] == "yes_band", yes_kw["audit_extra"]
+    assert yes_kw["audit_extra"]["yes_price"] == "0.83", yes_kw["audit_extra"]
+    assert yes_kw["audit_extra"]["fill_mode"] == "yes_band", yes_kw["audit_extra"]
+    # the NO leg is judged independently — it takes on its own ask, not because the band is open
+    assert no_kw["taker"] is True and no_kw["post_only"] is False, no_kw
+    assert no_kw["audit_extra"]["taker_gate"] == "no_leg_ask", no_kw["audit_extra"]
+    assert no_kw["cap"] == Decimal("0.65"), no_kw
+
+    # the YES ladder rung and the port band agree exactly, and an ineligible YES ask produces
+    # no order at all (never a resting order)
+    def _yes_probe(ask):
+        probe = {**books, "TOK_YES": {**yes_book, "best_ask": ask,
+                                      "asks": [{"price": ask, "size": "50"}]}}
+        _cfg, _pos, lad, out = _fire_run("0.83", books_by_token=probe)
+        statuses = [i["status"] for i in lad if i.get("leg") == "buy_yes_new"]
+        return (statuses[0] if statuses else None), [kw for kw in out if kw["token_id"] == "TOK_YES"]
+
+    for ask, want in (("0.40", False), ("0.48", False), ("0.4801", True), ("0.8999", True),
+                      ("0.90", True), ("0.9001", False)):
+        status, yes_calls = _yes_probe(ask)
+        if want:
+            assert status == "send_fak" and len(yes_calls) >= 1, (ask, status, yes_calls)
+            assert all(kw["taker"] is True for kw in yes_calls), (ask, yes_calls)
+        else:
+            assert status != "send_fak", (ask, status)
+            assert yes_calls == [], (ask, yes_calls)
+
+    # a leg whose book is empty is skipped as no_book — and still nothing passive is ever sent
+    bare = {**BOOKS, "TOK_NO": NO_BOOK, "TOK_YES": NO_BOOK}
+    _cfg, _pos, lad, out = _fire_run("0.83", books_by_token=bare)
+    assert out == [], out
+    assert {i["status"] for i in lad} <= {"no_book"}, lad
+    assert all(kw["post_only"] is False for kw in out), out
+
+
 # --------------------------------------------------------------------------- helper
 
 @contextlib.contextmanager
@@ -930,62 +1625,36 @@ def _patched(module, **attributes):
             setattr(module, name, value)
 
 
-def test_live_port_taker_fak_and_yes_window():
-    """LivePort.match allows paper-like taker FAK fills, and enforces (0.48, 0.90] for YES."""
-    transport = _StubTransport(results=[
-        {"ok": True, "status": "matched", "filled_shares": Decimal("10"), "avg_price": Decimal("0.55"),
-         "cost": Decimal("5.5"), "unfilled": ZERO, "detail": ""}
-    ])
-    port = _live_port(transport, account=ACCOUNT_OK, preflight=True)
-
-    # 1. YES leg within (0.48, 0.90] with order_type=FAK -> executed as taker
-    yes_leg_valid = {"leg": "buy_yes_new", "outcome": "YES", "token_id": "TOK_YES",
-                     "order_type": "FAK", "side": "BUY", "best_ask": "0.55"}
-    res1 = port.match(leg=yes_leg_valid, book={"best_ask": "0.55"}, limit=Decimal("0.55"), shares=Decimal("10"))
-    assert res1["filled_shares"] == Decimal("10"), res1
-    call1 = transport.calls[-1][1]
-    assert call1["post_only"] is False, "FAK taker order must have post_only=False"
-    assert call1["order_type"] == "FAK", "FAK taker order must have order_type=FAK"
-    assert call1["clamp"] is False, "FAK taker order must not be clamped"
-
-    # 2. YES leg <= 0.48 (e.g. 0.40, 0.48) -> denied
-    for invalid_floor in ("0.40", "0.48"):
-        res_floor = port.match(leg={**yes_leg_valid, "best_ask": invalid_floor},
-                               book={"best_ask": invalid_floor}, limit=Decimal(invalid_floor), shares=Decimal("10"))
-        assert res_floor["status"] == "denied_yes_range", res_floor
-        assert res_floor["filled_shares"] == ZERO
-
-    # 3. YES leg > 0.90 (e.g. 0.91) -> denied
-    res_cap = port.match(leg={**yes_leg_valid, "best_ask": "0.91"},
-                         book={"best_ask": "0.91"}, limit=Decimal("0.91"), shares=Decimal("10"))
-    assert res_cap["status"] == "denied_yes_range", res_cap
-    assert res_cap["filled_shares"] == ZERO
-
-    # 4. YES leg attempted as passive maker / post_only -> strictly denied (never downgrade to maker)
-    res_maker = port.match(leg={**yes_leg_valid, "post_only": True},
-                           book={"best_ask": "0.55"}, limit=Decimal("0.55"), shares=Decimal("10"))
-    assert res_maker["status"] == "denied_yes_maker", res_maker
-    assert res_maker["filled_shares"] == ZERO
-
-
 CHECKS = [
     ("config: env overrides (mode/budget/max_open)", test_load_config_env_overrides),
     ("config: live via env still needs port gates", test_env_override_live_still_needs_port_gates),
     ("port: selection matrix (no downgrade)", test_port_selection_matrix),
-    ("port: missing v2 SDK ⇒ live_deps_missing (F3)", test_port_selection_matrix),
+    ("port: missing v2 SDK ⇒ live_deps_missing (F3)", test_port_missing_v2_sdk_fails_closed),
     ("paper: fire matches pre-port golden", test_paper_fire_matches_pre_port_golden),
     ("paper: port == matcher + ledger", test_paper_port_matches_matcher_and_ledger),
     ("paper: live without gates never falls back", test_paper_fire_refuses_when_live_has_no_gates),
     ("paper: stdlib run needs no v2 SDK", test_paper_engine_needs_no_v2_sdk),
     ("live: preflight honours real caps", test_live_port_preflight_uses_real_caps),
     ("live: match branches (partial/full/none/cancel/timeout)", test_live_port_match_branches),
-    ("live: taker FAK and YES window (0.48, 0.90]", test_live_port_taker_fak_and_yes_window),
     ("v2: clamp keeps orders passive", test_v2_clamp_limit),
     ("v2: execute_leg end to end (stub)", test_v2_execute_leg_end_to_end),
     ("v2: cancel retry + residual risk", test_v2_cancel_retry_and_residual_risk),
     ("v2: cancel shapes tolerated", test_v2_cancel_summary_tolerates_shapes),
     ("v2: poll_fill branches", test_v2_poll_fill_branches),
     ("v2: sentinel least privilege", test_v2_sentinels_least_privilege),
+    ("live taker: YES band (0.48, 0.90] matrix", test_live_taker_yes_band_matrix),
+    ("live taker: leg scope independent (YES band vs NO book)", test_live_leg_scope_is_independent),
+    ("live taker: bad ask quote ⇒ ask_out_of_range (not no_book)", test_live_ask_quote_out_of_range_is_not_no_book),
+    ("live taker: no passive fallback anywhere", test_live_no_passive_fallback_anywhere),
+    ("live taker: cap required + bounded (L-2)", test_live_taker_cap_required_and_bounded),
+    ("live taker: absolute price bounds (L-3)", test_live_taker_price_bounds),
+    ("live taker: evidence chain (leg → fire → re-quote)", test_live_taker_evidence_chain),
+    ("live taker: order construction (FAK, no clamp)", test_live_taker_order_construction),
+    ("live taker: partial/zero fill accounting", test_live_taker_fill_accounting),
+    ("live taker: gates/preflight not bypassable", test_live_taker_gates_not_bypassable),
+    ("live taker: limits kept, band fail-closed", test_live_taker_limits_and_band_fail_closed),
+    ("live taker: pure decision adds no audit row (L-1)", test_live_taker_decision_alone_is_not_audited),
+    ("live taker: engine fire path is leg-level", test_live_fire_intent_is_leg_level),
 ]
 
 
