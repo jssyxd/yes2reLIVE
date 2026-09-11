@@ -186,7 +186,7 @@ class LivePort(ExecutionPort):
 
         is_yes = (str(leg.get("outcome") or "").upper() == "YES") or (str(leg.get("leg") or "") == "buy_yes_new")
         if is_yes:
-            # Hard-guard: 仅当 YES 在 (0.48, 0.90] 时才吃单
+            # 核心风控铁律：仅当 YES 在 (0.48, 0.90] 时才吃单；不在带内坚决彻底放弃买入（弃单），严禁降级为被动挂单去接盘！
             yes_floor = Decimal("0.48")
             yes_cap = Decimal("0.90")
             raw_ask = leg.get("best_ask")
@@ -200,11 +200,20 @@ class LivePort(ExecutionPort):
                 if ask_dec is not None and (ask_dec <= yes_floor or ask_dec > yes_cap):
                     return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
                             "status": "denied_yes_range", "source": LIVE,
-                            "detail": f"YES ask {ask_dec} not in (0.48, 0.90]"}
+                            "detail": f"YES ask {ask_dec} not in (0.48, 0.90]: strictly abandoned, never downgrade to maker"}
+            if limit <= yes_floor:
+                return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
+                        "status": "denied_yes_floor", "source": LIVE,
+                        "detail": f"YES limit {limit} <= 0.48: strictly abandoned, never downgrade to maker"}
             if limit > yes_cap:
                 return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
                         "status": "denied_yes_cap", "source": LIVE,
-                        "detail": f"YES limit {limit} > 0.90"}
+                        "detail": f"YES limit {limit} > 0.90: strictly abandoned"}
+            # 严禁任何形式将 YES 腿降级为被动挂单
+            if leg.get("post_only") is True:
+                return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
+                        "status": "denied_yes_maker", "source": LIVE,
+                        "detail": "YES leg must never downgrade to passive maker / post_only order"}
 
         # Taker FAK execution when order_type is FAK (paper-like fills against resting asks)
         order_type = str(leg.get("order_type") or "").upper()

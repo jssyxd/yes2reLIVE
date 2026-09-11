@@ -23,3 +23,6 @@ data/
 tmp/
 scratch/
 .pytest_cache/
+
+*.docx
+*.bak*

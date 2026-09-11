@@ -959,6 +959,12 @@ def test_live_port_taker_fak_and_yes_window():
     assert res_cap["status"] == "denied_yes_range", res_cap
     assert res_cap["filled_shares"] == ZERO
 
+    # 4. YES leg attempted as passive maker / post_only -> strictly denied (never downgrade to maker)
+    res_maker = port.match(leg={**yes_leg_valid, "post_only": True},
+                           book={"best_ask": "0.55"}, limit=Decimal("0.55"), shares=Decimal("10"))
+    assert res_maker["status"] == "denied_yes_maker", res_maker
+    assert res_maker["filled_shares"] == ZERO
+
 
 CHECKS = [
     ("config: env overrides (mode/budget/max_open)", test_load_config_env_overrides),

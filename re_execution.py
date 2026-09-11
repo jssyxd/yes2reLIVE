@@ -64,6 +64,7 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
     if ask is None:
         return {"status": "no_book", "leg": leg.get("leg"), "token_id": token, "cap": str(cap), "elapsed_ms": elapsed_ms, "note": "no_resting_ask_in_ladder"}
     # Check if this is the YES leg: strictly only fill when YES in (0.48, 0.90]
+    # 不在 (0.48, 0.90] 区间坚决彻底放弃买入（弃单），严禁降级为被动挂单接盘！
     is_yes = (str(leg.get("outcome") or "").upper() == "YES") or (str(leg.get("leg") or "") == "buy_yes_new")
     if is_yes:
         floor = Decimal("0.48")
@@ -77,7 +78,7 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
                 "floor": str(floor),
                 "cap": str(cap),
                 "elapsed_ms": elapsed_ms,
-                "note": "yes_below_floor_skip_rung",
+                "note": "yes_below_floor_strictly_abandon_never_maker",
             }
         if ask > cap:
             return {
@@ -86,7 +87,7 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
                 "best_ask": str(ask),
                 "cap": str(cap),
                 "elapsed_ms": elapsed_ms,
-                "note": "yes_above_cap_abort",
+                "note": "yes_above_cap_strictly_abandon",
             }
     else:
         # Non-YES legs (e.g. NO leg): use configured floor/cap
